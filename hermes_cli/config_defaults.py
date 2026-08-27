@@ -42,6 +42,19 @@ DEFAULT_CONFIG = {
         # behavior everywhere.
         "terminal_continue": True,
     },
+    # Optional local spend/workload circuit breaker.  Evaluated immediately
+    # before each provider call, unlike tool hooks which run after a model call.
+    # Disabled by default for backward compatibility; operators enable and
+    # size it in config.yaml for their account and workload.
+    "usage_limits": {
+        "enabled": False,
+        "max_session_tokens": 1_000_000,
+        "max_prompt_tokens": 180_000,
+        "max_session_api_calls": 80,
+        "max_inline_image_bytes": 12_000_000,
+        "max_inline_images": 4,
+        "warn_ratio": 0.75,
+    },
     "agent": {
         # Unlimited by default. The agent turn cap caused more problems than
         # it solved (silent mid-task truncation). null = unlimited; set a

@@ -2847,6 +2847,42 @@ def run_conversation(
                 if callable(_warn_fn):
                     _warn_fn(request_pressure_tokens, _ctx_len)
 
+        # Hard pre-provider workload gate.  Tool hooks cannot stop the model
+        # request that selected a tool, so the circuit breaker belongs here:
+        # after the exact request shape is known, before spinner/provider I/O.
+        from agent.session_budget import evaluate_provider_call_budget
+
+        _session_budget = evaluate_provider_call_budget(
+            agent,
+            approx_input_tokens=request_pressure_tokens,
+            request_messages=api_messages,
+        )
+        if _session_budget.blocked:
+            api_call_count -= 1
+            agent._api_call_count = api_call_count
+            agent.iteration_budget.refund()
+            _budget_message = f"🛑 {_session_budget.message}"
+            agent._buffer_status(_budget_message)
+            agent._flush_status_buffer()
+            try:
+                agent._persist_session(messages, conversation_history)
+            except Exception:
+                logger.warning("session budget block persistence failed", exc_info=True)
+            return {
+                "final_response": _budget_message,
+                "messages": messages,
+                "api_calls": api_call_count,
+                "completed": False,
+                "failed": True,
+                "error": _session_budget.message,
+            }
+        if (
+            _session_budget.status == "warn"
+            and not getattr(agent, "_session_budget_warned", False)
+        ):
+            agent._session_budget_warned = True
+            agent._buffer_status(f"⚠️ {_session_budget.message}")
+
         # Thinking spinner for quiet mode (animated during API call)
         thinking_spinner = None
         
