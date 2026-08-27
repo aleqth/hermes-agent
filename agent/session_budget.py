@@ -92,6 +92,33 @@ def _load_policy() -> dict[str, Any]:
     return policy if isinstance(policy, dict) else {}
 
 
+def _policy_for_route(
+    policy: dict[str, Any],
+    *,
+    model: str,
+    provider: str,
+) -> dict[str, Any]:
+    """Apply substring overrides to the concrete provider/model route.
+
+    Matching the combined route lets operators express a provider-family
+    budget (for example ``gemini``) without depending on every model id
+    containing the provider name.  Later matching entries intentionally win,
+    so a broad provider override can be refined by a model-specific one.
+    """
+    effective = dict(policy)
+    overrides = policy.get("model_overrides") or {}
+    if not isinstance(overrides, dict):
+        return effective
+    route_label = f"{provider}:{model}".lower()
+    for fragment, values in overrides.items():
+        if (
+            str(fragment or "").lower() in route_label
+            and isinstance(values, dict)
+        ):
+            effective.update(values)
+    return effective
+
+
 def _persisted_usage(agent: Any) -> tuple[int, int]:
     db = getattr(agent, "_session_db", None)
     session_id = getattr(agent, "session_id", None)
@@ -117,7 +144,11 @@ def evaluate_provider_call_budget(
     request_messages: Any,
 ) -> SessionBudgetDecision:
     """Evaluate the next provider request before it can consume credits."""
-    policy = _load_policy()
+    policy = _policy_for_route(
+        _load_policy(),
+        model=str(getattr(agent, "model", "") or ""),
+        provider=str(getattr(agent, "provider", "") or ""),
+    )
     persisted_tokens, persisted_calls = _persisted_usage(agent)
     live_tokens = (
         _positive_int(getattr(agent, "session_total_tokens", 0))

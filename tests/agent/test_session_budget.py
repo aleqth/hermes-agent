@@ -18,6 +18,8 @@ def _agent(**overrides):
         "session_cache_write_tokens": 0,
         "session_api_calls": 0,
         "max_tokens": 32000,
+        "model": "moonshotai/kimi-k3",
+        "provider": "openrouter",
         "_session_db": None,
     }
     values.update(overrides)
@@ -111,3 +113,29 @@ def test_disabled_policy_is_noop():
 def test_decision_block_property():
     decision = SessionBudgetDecision("block", "stop", 1, 2, 3, 4, 5)
     assert decision.blocked
+
+
+def test_gemini_route_gets_larger_workload_without_widening_other_models():
+    policy = _policy(
+        model_overrides={"gemini": {"max_session_tokens": 10_000_000}}
+    )
+    with patch("agent.session_budget._load_policy", return_value=policy):
+        gemini = evaluate_provider_call_budget(
+            _agent(
+                session_total_tokens=1_100_000,
+                model="3.7-flash",
+                provider="gemini",
+            ),
+            approx_input_tokens=1000,
+            request_messages=[],
+        )
+        kimi = evaluate_provider_call_budget(
+            _agent(session_total_tokens=1_100_000),
+            approx_input_tokens=1000,
+            request_messages=[],
+        )
+
+    assert gemini.status == "ok"
+    assert not gemini.blocked
+    assert kimi.blocked
+    assert "1,000,000-token limit" in kimi.message

@@ -54,6 +54,9 @@ DEFAULT_CONFIG = {
         "max_inline_image_bytes": 12_000_000,
         "max_inline_images": 4,
         "warn_ratio": 0.75,
+        # Substring matches against the concrete ``provider:model`` route.
+        # Example: {"gemini": {"max_session_tokens": 10_000_000}}.
+        "model_overrides": {},
     },
     "agent": {
         # Unlimited by default. The agent turn cap caused more problems than
