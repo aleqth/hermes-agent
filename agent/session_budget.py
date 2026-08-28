@@ -21,10 +21,15 @@ class SessionBudgetDecision:
     current_api_calls: int
     inline_image_bytes: int
     inline_image_count: int
+    auto_rollover: bool = False
 
     @property
     def blocked(self) -> bool:
         return self.status == "block"
+
+    @property
+    def rollover_requested(self) -> bool:
+        return self.status == "rollover" and self.auto_rollover
 
 
 def _positive_int(value: Any) -> int:
@@ -172,6 +177,7 @@ def evaluate_provider_call_budget(
             current_api_calls=current_calls,
             inline_image_bytes=image_bytes,
             inline_image_count=image_count,
+            auto_rollover=bool(policy.get("auto_rollover", False)),
         )
 
     if not policy.get("enabled", False):
@@ -196,6 +202,13 @@ def evaluate_provider_call_budget(
             f"compact first. {label}",
         )
     if session_cap and projected_tokens > session_cap:
+        if policy.get("auto_rollover", False):
+            return decision(
+                "rollover",
+                f"Session workload reached its {session_cap:,}-token segment "
+                f"limit. Preserve a durable handoff and continue in a fresh "
+                f"child segment before the next provider call. {label}",
+            )
         return decision(
             "block",
             f"Provider call blocked before spend: projected session workload "
@@ -203,6 +216,13 @@ def evaluate_provider_call_budget(
             f"start /new. {label}",
         )
     if call_cap and current_calls >= call_cap:
+        if policy.get("auto_rollover", False):
+            return decision(
+                "rollover",
+                f"Session reached its {call_cap}-call segment limit. Preserve "
+                f"a durable handoff and continue in a fresh child segment "
+                f"before the next provider call. {label}",
+            )
         return decision(
             "block",
             f"Provider call blocked before spend: this session already made "
@@ -233,6 +253,11 @@ def evaluate_provider_call_budget(
         return decision(
             "warn",
             f"Session workload warning: {label}; hard limit={session_cap:,}. "
-            "Finish this bounded step and prepare /new.",
+            + (
+                "Hermes will roll this conversation into a durable child "
+                "segment automatically."
+                if policy.get("auto_rollover", False)
+                else "Finish this bounded step and prepare /new."
+            ),
         )
     return decision("ok", label)

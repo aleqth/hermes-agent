@@ -139,3 +139,44 @@ def test_gemini_route_gets_larger_workload_without_widening_other_models():
     assert not gemini.blocked
     assert kimi.blocked
     assert "1,000,000-token limit" in kimi.message
+
+
+def test_gemini_segment_requests_rollover_instead_of_blocking():
+    policy = _policy(
+        model_overrides={
+            "gemini": {
+                "max_session_tokens": 10_000_000,
+                "auto_rollover": True,
+            }
+        }
+    )
+    with patch("agent.session_budget._load_policy", return_value=policy):
+        result = evaluate_provider_call_budget(
+            _agent(
+                session_total_tokens=9_980_000,
+                model="gemini-3-flash",
+                provider="gemini",
+            ),
+            approx_input_tokens=20_000,
+            request_messages=[],
+        )
+
+    assert result.status == "rollover"
+    assert result.rollover_requested
+    assert not result.blocked
+    assert "fresh child segment" in result.message
+
+
+def test_auto_rollover_also_segments_api_call_budget():
+    with patch(
+        "agent.session_budget._load_policy",
+        return_value=_policy(auto_rollover=True),
+    ):
+        result = evaluate_provider_call_budget(
+            _agent(session_api_calls=80),
+            approx_input_tokens=1000,
+            request_messages=[],
+        )
+
+    assert result.rollover_requested
+    assert "80-call segment limit" in result.message

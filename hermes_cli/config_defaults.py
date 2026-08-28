@@ -55,7 +55,10 @@ DEFAULT_CONFIG = {
         "max_inline_images": 4,
         "warn_ratio": 0.75,
         # Substring matches against the concrete ``provider:model`` route.
-        # Example: {"gemini": {"max_session_tokens": 10_000_000}}.
+        # ``auto_rollover`` preserves a compacted handoff in a fresh child
+        # session before the next provider call instead of stopping the shell.
+        # Example: {"gemini": {"max_session_tokens": 10_000_000,
+        #                      "auto_rollover": True}}.
         "model_overrides": {},
     },
     "agent": {

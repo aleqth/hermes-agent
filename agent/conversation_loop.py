@@ -2619,6 +2619,20 @@ def run_conversation(
                 pass
             break
 
+        # Evaluate the spend/workload boundary before context preflight so a
+        # provider-scoped policy can request a durable session rollover.  The
+        # rollover reuses Hermes' compression lineage instead of replaying a
+        # crashed process with ``--continue``: same shell and logical
+        # conversation, fresh child-session usage counters, compacted handoff.
+        from agent.session_budget import evaluate_provider_call_budget
+
+        _session_budget = evaluate_provider_call_budget(
+            agent,
+            approx_input_tokens=request_pressure_tokens,
+            request_messages=api_messages,
+        )
+        _budget_rollover = _session_budget.rollover_requested
+
         # Pre-API pressure check. The turn-prologue preflight only saw the
         # incoming user message; a single turn can then grow by many large
         # tool results and leave no output budget before the NEXT call (the
@@ -2674,15 +2688,18 @@ def run_conversation(
         _compression_cooldown = getattr(
             _compressor, "get_active_compression_failure_cooldown", lambda: None
         )()
+        _ordinary_preflight_compression = (
+            not _preflight_compression_blocked
+            and not _defer_preflight(request_pressure_tokens)
+            and not _compression_cooldown
+            and _compressor.should_compress(request_pressure_tokens)
+        )
         if (
             agent.compression_enabled
             and not _review_fork_first_request_pending(agent)
             and len(messages) > 1
             and compression_attempts < max_compression_attempts
-            and not _preflight_compression_blocked
-            and not _defer_preflight(request_pressure_tokens)
-            and not _compression_cooldown
-            and _compressor.should_compress(request_pressure_tokens)
+            and (_budget_rollover or _ordinary_preflight_compression)
         ):
             if _moa_prepared_request is not None:
                 pending_moa_prepared_request = _moa_prepared_request
@@ -2697,8 +2714,9 @@ def run_conversation(
             if callable(_clear_warn):
                 _clear_warn()
             logger.info(
-                "Pre-API compression: ~%s request tokens >= %s threshold "
+                "%s: ~%s request tokens, threshold=%s "
                 "(context=%s, attempt=%s/%s)",
+                "Workload-segment rollover" if _budget_rollover else "Pre-API compression",
                 f"{request_pressure_tokens:,}",
                 f"{int(getattr(_compressor, 'threshold_tokens', 0) or 0):,}",
                 f"{int(getattr(_compressor, 'context_length', 0) or 0):,}"
@@ -2706,33 +2724,49 @@ def run_conversation(
                 compression_attempts,
                 max_compression_attempts,
             )
-            _pre_api_status = automatic_compaction_status_message(
-                _compressor,
-                phase="pre_api",
-                default_message=PRE_API_COMPRESSION_STATUS_TEMPLATE.format(
-                    tokens=request_pressure_tokens
-                ),
-                approx_tokens=request_pressure_tokens,
-                threshold_tokens=int(
-                    getattr(_compressor, "threshold_tokens", 0) or 0
-                ),
-                context_length=int(
-                    getattr(_compressor, "context_length", 0) or 0
-                ),
-                model=agent.model,
-                attempt=compression_attempts,
-                max_attempts=max_compression_attempts,
-            )
+            if _budget_rollover:
+                _pre_api_status = (
+                    "🔄 Workload segment complete — preserving a durable "
+                    "handoff and continuing in this conversation…"
+                )
+            else:
+                _pre_api_status = automatic_compaction_status_message(
+                    _compressor,
+                    phase="pre_api",
+                    default_message=PRE_API_COMPRESSION_STATUS_TEMPLATE.format(
+                        tokens=request_pressure_tokens
+                    ),
+                    approx_tokens=request_pressure_tokens,
+                    threshold_tokens=int(
+                        getattr(_compressor, "threshold_tokens", 0) or 0
+                    ),
+                    context_length=int(
+                        getattr(_compressor, "context_length", 0) or 0
+                    ),
+                    model=agent.model,
+                    attempt=compression_attempts,
+                    max_attempts=max_compression_attempts,
+                )
             if _pre_api_status:
                 agent._emit_status(_pre_api_status)
             _last_preflight_pressure = request_pressure_tokens
             _pre_api_input = messages
-            messages, active_system_prompt = agent._compress_context(
-                messages,
-                system_message,
-                approx_tokens=request_pressure_tokens,
-                task_id=effective_task_id,
-            )
+            _prior_in_place = getattr(agent, "compression_in_place", True)
+            if _budget_rollover:
+                # A workload rollover must mint a child session so usage
+                # counters reset. Ordinary context compaction keeps its
+                # configured in-place behavior.
+                agent.compression_in_place = False
+            try:
+                messages, active_system_prompt = agent._compress_context(
+                    messages,
+                    system_message,
+                    approx_tokens=request_pressure_tokens,
+                    task_id=effective_task_id,
+                )
+            finally:
+                if _budget_rollover:
+                    agent.compression_in_place = _prior_in_place
             if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
                 # #69870 lock-skip: another path holds this session's
                 # compression lock, so this pass no-oped. That is a temporary
@@ -2850,13 +2884,23 @@ def run_conversation(
         # Hard pre-provider workload gate.  Tool hooks cannot stop the model
         # request that selected a tool, so the circuit breaker belongs here:
         # after the exact request shape is known, before spinner/provider I/O.
-        from agent.session_budget import evaluate_provider_call_budget
-
-        _session_budget = evaluate_provider_call_budget(
-            agent,
-            approx_input_tokens=request_pressure_tokens,
-            request_messages=api_messages,
-        )
+        # A requested rollover reaches here only when automatic compression
+        # was unavailable, skipped, or failed. Fail closed instead of spending
+        # against the completed segment.
+        if _session_budget.rollover_requested:
+            _session_budget = type(_session_budget)(
+                status="block",
+                message=(
+                    "Automatic workload handoff could not complete safely. "
+                    + _session_budget.message
+                ),
+                current_tokens=_session_budget.current_tokens,
+                projected_tokens=_session_budget.projected_tokens,
+                current_api_calls=_session_budget.current_api_calls,
+                inline_image_bytes=_session_budget.inline_image_bytes,
+                inline_image_count=_session_budget.inline_image_count,
+                auto_rollover=_session_budget.auto_rollover,
+            )
         if _session_budget.blocked:
             api_call_count -= 1
             agent._api_call_count = api_call_count
