@@ -201,6 +201,16 @@ def evaluate_provider_call_budget(
             f"reaches the {prompt_cap:,}-token request limit. Start /new or "
             f"compact first. {label}",
         )
+    # This is an independent runaway guard, not a segment-size trigger. Check
+    # it before token rollover so reaching both rails cannot erase a runaway
+    # call condition by rotating counters.
+    if call_cap and current_calls >= call_cap:
+        return decision(
+            "block",
+            f"Provider call blocked before spend: this session already made "
+            f"{current_calls} API calls (limit {call_cap}). Preserve a handoff "
+            f"and start /new. {label}",
+        )
     if session_cap and projected_tokens > session_cap:
         if policy.get("auto_rollover", False):
             return decision(
@@ -214,20 +224,6 @@ def evaluate_provider_call_budget(
             f"Provider call blocked before spend: projected session workload "
             f"exceeds the {session_cap:,}-token limit. Preserve a handoff and "
             f"start /new. {label}",
-        )
-    if call_cap and current_calls >= call_cap:
-        if policy.get("auto_rollover", False):
-            return decision(
-                "rollover",
-                f"Session reached its {call_cap}-call segment limit. Preserve "
-                f"a durable handoff and continue in a fresh child segment "
-                f"before the next provider call. {label}",
-            )
-        return decision(
-            "block",
-            f"Provider call blocked before spend: this session already made "
-            f"{current_calls} API calls (limit {call_cap}). Preserve a handoff "
-            f"and start /new. {label}",
         )
     if image_count_cap and image_count > image_count_cap:
         return decision(

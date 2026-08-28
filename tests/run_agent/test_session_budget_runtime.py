@@ -66,6 +66,19 @@ def test_auto_rollover_forces_child_segment_then_calls_provider():
     agent.client = MagicMock()
     agent.compression_enabled = True
     agent.compression_in_place = True
+    agent.session_id = "session-parent"
+    agent.session_total_tokens = 10_000_001
+    agent.session_input_tokens = 9_900_000
+    agent.session_output_tokens = 100_001
+    agent.session_prompt_tokens = 9_900_000
+    agent.session_completion_tokens = 100_001
+    agent.session_cache_read_tokens = 50_000
+    agent.session_cache_write_tokens = 1_000
+    agent.session_reasoning_tokens = 42
+    agent.session_api_calls = 12
+    agent.session_estimated_cost_usd = 3.14
+    agent.session_cost_status = "estimated"
+    agent.session_cost_source = "test"
     message = SimpleNamespace(
         content="continued after handoff",
         reasoning_content=None,
@@ -83,6 +96,27 @@ def test_auto_rollover_forces_child_segment_then_calls_provider():
     ok = SessionBudgetDecision("ok", "fresh segment", 0, 20_000, 0, 0, 0, True)
     compression_modes = []
 
+    def _evaluate_budget(*_args, **_kwargs):
+        if agent.session_id == "session-parent":
+            return rollover
+        assert agent.session_id == "session-child"
+        for counter in (
+            "session_total_tokens",
+            "session_input_tokens",
+            "session_output_tokens",
+            "session_prompt_tokens",
+            "session_completion_tokens",
+            "session_cache_read_tokens",
+            "session_cache_write_tokens",
+            "session_reasoning_tokens",
+            "session_api_calls",
+        ):
+            assert getattr(agent, counter) == 0
+        assert agent.session_estimated_cost_usd == 0.0
+        assert agent.session_cost_status == "unknown"
+        assert agent.session_cost_source == "none"
+        return ok
+
     def _rotate(messages, system_message, **_kwargs):
         compression_modes.append(agent.compression_in_place)
         agent.session_id = "session-child"
@@ -96,8 +130,8 @@ def test_auto_rollover_forces_child_segment_then_calls_provider():
     with (
         patch(
             "agent.session_budget.evaluate_provider_call_budget",
-            side_effect=[rollover, ok],
-        ),
+            side_effect=_evaluate_budget,
+        ) as evaluate_budget,
         patch.object(agent.context_compressor, "should_compress", return_value=False),
         patch.object(agent, "_compress_context", side_effect=_rotate),
         patch.object(agent, "_persist_session"),
@@ -113,4 +147,5 @@ def test_auto_rollover_forces_child_segment_then_calls_provider():
     assert agent.session_id == "session-child"
     assert result["completed"] is True
     assert result["final_response"] == "continued after handoff"
+    assert evaluate_budget.call_count == 2
     assert agent.client.chat.completions.create.call_count == 1

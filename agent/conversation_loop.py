@@ -2751,6 +2751,7 @@ def run_conversation(
                 agent._emit_status(_pre_api_status)
             _last_preflight_pressure = request_pressure_tokens
             _pre_api_input = messages
+            _rollover_parent_session_id = agent.session_id
             _prior_in_place = getattr(agent, "compression_in_place", True)
             if _budget_rollover:
                 # A workload rollover must mint a child session so usage
@@ -2767,6 +2768,32 @@ def run_conversation(
             finally:
                 if _budget_rollover:
                     agent.compression_in_place = _prior_in_place
+            _rollover_committed = bool(
+                _budget_rollover
+                and agent.session_id
+                and agent.session_id != _rollover_parent_session_id
+            )
+            if _rollover_committed:
+                # Compression already migrated the logical session state and
+                # notified context providers. Reset only the fresh child
+                # segment's usage meters; resetting the context engines here
+                # would discard the durable handoff that was just committed.
+                for _counter in (
+                    "session_total_tokens",
+                    "session_input_tokens",
+                    "session_output_tokens",
+                    "session_prompt_tokens",
+                    "session_completion_tokens",
+                    "session_cache_read_tokens",
+                    "session_cache_write_tokens",
+                    "session_reasoning_tokens",
+                    "session_api_calls",
+                ):
+                    setattr(agent, _counter, 0)
+                agent.session_estimated_cost_usd = 0.0
+                agent.session_cost_status = "unknown"
+                agent.session_cost_source = "none"
+                agent._session_budget_warned = False
             if messages is _pre_api_input and compression_skipped_due_to_lock(agent):
                 # #69870 lock-skip: another path holds this session's
                 # compression lock, so this pass no-oped. That is a temporary

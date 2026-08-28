@@ -167,16 +167,17 @@ def test_gemini_segment_requests_rollover_instead_of_blocking():
     assert "fresh child segment" in result.message
 
 
-def test_auto_rollover_also_segments_api_call_budget():
+def test_auto_rollover_does_not_bypass_api_call_budget():
     with patch(
         "agent.session_budget._load_policy",
         return_value=_policy(auto_rollover=True),
     ):
         result = evaluate_provider_call_budget(
-            _agent(session_api_calls=80),
-            approx_input_tokens=1000,
+            _agent(session_api_calls=80, session_total_tokens=9_999_000),
+            approx_input_tokens=20_000,
             request_messages=[],
         )
 
-    assert result.rollover_requested
-    assert "80-call segment limit" in result.message
+    assert result.blocked
+    assert not result.rollover_requested
+    assert "80 API calls" in result.message
