@@ -4,9 +4,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from agent.session_budget import (
+    InlineImageSanitization,
     SessionBudgetDecision,
     evaluate_provider_call_budget,
     measure_inline_images,
+    sanitize_inline_images_for_provider,
 )
 
 
@@ -94,6 +96,82 @@ def test_blocks_replayed_screenshot_fanout():
         )
     assert result.blocked
     assert "3 inline images" in result.message
+
+
+def _image(value: str):
+    return {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64," + value},
+    }
+
+
+def test_provider_copy_keeps_newest_unique_images_without_mutating_history():
+    messages = [
+        {"role": "user", "content": [{"type": "text", "text": "old"}, _image("A")]},
+        {"role": "user", "content": [_image("B"), _image("A")]},
+        {"role": "user", "content": [_image("C"), _image("D"), _image("E")]},
+    ]
+    with patch(
+        "agent.session_budget._load_policy",
+        return_value=_policy(max_inline_images=4),
+    ):
+        sanitized, report = sanitize_inline_images_for_provider(_agent(), messages)
+
+    assert report == InlineImageSanitization(
+        original_count=6,
+        original_bytes=measure_inline_images(messages)[0],
+        kept_count=4,
+        kept_bytes=measure_inline_images(sanitized)[0],
+        duplicate_count=1,
+        overflow_count=1,
+    )
+    assert measure_inline_images(messages)[1] == 6
+    assert measure_inline_images(sanitized)[1] == 4
+    assert "data:image/png;base64,A" in str(sanitized)
+    assert "data:image/png;base64,B" not in str(sanitized)
+    assert "data:image/png;base64,E" in str(sanitized)
+    assert "Conversation history was preserved" in report.notice
+
+
+def test_provider_copy_trims_oldest_images_to_byte_cap_but_keeps_oversize_newest():
+    messages = [{"role": "user", "content": [_image("A" * 20), _image("B" * 20)]}]
+    newest_size = len("data:image/png;base64," + ("B" * 20))
+    with patch(
+        "agent.session_budget._load_policy",
+        return_value=_policy(max_inline_images=4, max_inline_image_bytes=newest_size),
+    ):
+        sanitized, report = sanitize_inline_images_for_provider(_agent(), messages)
+    assert report.kept_count == 1
+    assert report.overflow_count == 1
+    assert "data:image/png;base64,B" in str(sanitized)
+
+    oversized = [{"role": "user", "content": [_image("Z" * 100)]}]
+    with patch(
+        "agent.session_budget._load_policy",
+        return_value=_policy(max_inline_image_bytes=10),
+    ):
+        retained, report = sanitize_inline_images_for_provider(_agent(), oversized)
+        decision = evaluate_provider_call_budget(
+            _agent(), approx_input_tokens=1000, request_messages=retained
+        )
+    assert report.kept_count == 1
+    assert not report.changed
+    assert decision.blocked
+    assert "inline image payloads total" in decision.message
+
+
+def test_provider_copy_counts_and_sanitizes_gemini_inline_data():
+    image = {"inline_data": {"mime_type": "image/png", "data": "AAAA"}}
+    messages = [{"role": "user", "parts": [image, image, image, image, image]}]
+    with patch(
+        "agent.session_budget._load_policy",
+        return_value=_policy(max_inline_images=4),
+    ):
+        sanitized, report = sanitize_inline_images_for_provider(_agent(), messages)
+    assert report.original_count == 5
+    assert report.kept_count == 1
+    assert report.duplicate_count == 4
+    assert measure_inline_images(sanitized) == (4, 1)
 
 
 def test_disabled_policy_is_noop():

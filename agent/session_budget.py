@@ -8,6 +8,7 @@ conversation, preserving prompt-cache stability.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -30,6 +31,38 @@ class SessionBudgetDecision:
     @property
     def rollover_requested(self) -> bool:
         return self.status == "rollover" and self.auto_rollover
+
+
+@dataclass(frozen=True)
+class InlineImageSanitization:
+    """What changed in the provider-bound copy of a multimodal request."""
+
+    original_count: int = 0
+    original_bytes: int = 0
+    kept_count: int = 0
+    kept_bytes: int = 0
+    duplicate_count: int = 0
+    overflow_count: int = 0
+
+    @property
+    def removed_count(self) -> int:
+        return self.duplicate_count + self.overflow_count
+
+    @property
+    def changed(self) -> bool:
+        return self.removed_count > 0
+
+    @property
+    def notice(self) -> str:
+        if not self.changed:
+            return ""
+        return (
+            f"Images: using the newest {self.kept_count} unique inline "
+            f"image{'s' if self.kept_count != 1 else ''}; omitted "
+            f"{self.removed_count} older or repeated "
+            f"image{'s' if self.removed_count != 1 else ''} from this "
+            "provider request. Conversation history was preserved."
+        )
 
 
 def _positive_int(value: Any) -> int:
@@ -76,14 +109,167 @@ def measure_inline_images(value: Any) -> tuple[int, int]:
         if source_type == "base64" and isinstance(source_data, str):
             total_bytes += len(source_data)
             total_count += 1
+        inline_data = value.get("inline_data")
+        if isinstance(inline_data, Mapping) and isinstance(inline_data.get("data"), str):
+            total_bytes += len(inline_data["data"])
+            total_count += 1
         for key, item in value.items():
             if key == "data" and source_type == "base64":
+                continue
+            if key == "inline_data" and isinstance(inline_data, Mapping):
                 continue
             item_bytes, item_count = measure_inline_images(item)
             total_bytes += item_bytes
             total_count += item_count
         return total_bytes, total_count
     return 0, 0
+
+
+def _inline_image_candidate(value: Any) -> tuple[str, int] | None:
+    """Return a stable fingerprint and encoded size for one image part."""
+    if not isinstance(value, Mapping):
+        return None
+    part_type = str(value.get("type") or "").lower()
+    payload = ""
+    media_type = ""
+
+    if part_type in {"image_url", "input_image"}:
+        image_url = value.get("image_url")
+        if isinstance(image_url, Mapping):
+            image_url = image_url.get("url")
+        if not isinstance(image_url, str):
+            image_url = value.get("url")
+        if isinstance(image_url, str) and image_url.startswith("data:image/"):
+            payload = image_url
+    elif part_type == "image":
+        source = value.get("source")
+        if (
+            isinstance(source, Mapping)
+            and str(source.get("type") or "").lower() == "base64"
+            and isinstance(source.get("data"), str)
+        ):
+            payload = source["data"]
+            media_type = str(source.get("media_type") or "")
+
+    inline_data = value.get("inline_data")
+    if (
+        not payload
+        and isinstance(inline_data, Mapping)
+        and isinstance(inline_data.get("data"), str)
+    ):
+        payload = inline_data["data"]
+        media_type = str(inline_data.get("mime_type") or inline_data.get("mimeType") or "")
+
+    if not payload:
+        return None
+    digest = hashlib.sha256()
+    digest.update(media_type.encode("utf-8", errors="replace"))
+    digest.update(b"\0")
+    digest.update(payload.encode("utf-8", errors="replace"))
+    return digest.hexdigest(), len(payload)
+
+
+def sanitize_inline_images_for_provider(
+    agent: Any,
+    request_messages: Any,
+) -> tuple[Any, InlineImageSanitization]:
+    """Trim only the provider-bound request to its newest unique images.
+
+    Hermes' durable message/session history is deliberately not mutated. The
+    request tree is rebuilt with shared immutable strings, so even multi-MB
+    data URLs are not duplicated in memory. Newest messages and newest image
+    parts win. If the newest single image exceeds the byte cap it is retained
+    so the hard budget guard can still fail closed with an actionable error.
+    """
+    policy = _policy_for_route(
+        _load_policy(),
+        model=str(getattr(agent, "model", "") or ""),
+        provider=str(getattr(agent, "provider", "") or ""),
+    )
+    if not policy.get("enabled", False):
+        return request_messages, InlineImageSanitization()
+
+    count_cap = _positive_int(policy.get("max_inline_images"))
+    byte_cap = _positive_int(policy.get("max_inline_image_bytes"))
+    candidates: list[tuple[tuple[Any, ...], str, int]] = []
+
+    def collect(value: Any, path: tuple[Any, ...]) -> None:
+        candidate = _inline_image_candidate(value)
+        if candidate is not None:
+            candidates.append((path, candidate[0], candidate[1]))
+            return
+        if isinstance(value, list) or isinstance(value, tuple):
+            for index, item in enumerate(value):
+                collect(item, path + (index,))
+        elif isinstance(value, Mapping):
+            for key, item in value.items():
+                collect(item, path + (key,))
+
+    collect(request_messages, ())
+    if not candidates:
+        return request_messages, InlineImageSanitization()
+
+    kept_paths: set[tuple[Any, ...]] = set()
+    seen: set[str] = set()
+    kept_bytes = 0
+    duplicate_count = 0
+    overflow_count = 0
+    for path, fingerprint, size in reversed(candidates):
+        if fingerprint in seen:
+            duplicate_count += 1
+            continue
+        seen.add(fingerprint)
+        if count_cap and len(kept_paths) >= count_cap:
+            overflow_count += 1
+            continue
+        if byte_cap and kept_paths and kept_bytes + size > byte_cap:
+            overflow_count += 1
+            continue
+        kept_paths.add(path)
+        kept_bytes += size
+
+    report = InlineImageSanitization(
+        original_count=len(candidates),
+        original_bytes=sum(item[2] for item in candidates),
+        kept_count=len(kept_paths),
+        kept_bytes=kept_bytes,
+        duplicate_count=duplicate_count,
+        overflow_count=overflow_count,
+    )
+    if not report.changed:
+        return request_messages, report
+
+    candidate_paths = {item[0] for item in candidates}
+    dropped_paths = candidate_paths - kept_paths
+    dropped = object()
+
+    def rebuild(value: Any, path: tuple[Any, ...]) -> Any:
+        if path in dropped_paths:
+            return dropped
+        if isinstance(value, list):
+            result = []
+            for index, item in enumerate(value):
+                child = rebuild(item, path + (index,))
+                if child is not dropped:
+                    result.append(child)
+            return result
+        if isinstance(value, tuple):
+            result = []
+            for index, item in enumerate(value):
+                child = rebuild(item, path + (index,))
+                if child is not dropped:
+                    result.append(child)
+            return tuple(result)
+        if isinstance(value, Mapping):
+            result = {}
+            for key, item in value.items():
+                child = rebuild(item, path + (key,))
+                if child is not dropped:
+                    result[key] = child
+            return result
+        return value
+
+    return rebuild(request_messages, ()), report
 
 
 def _load_policy() -> dict[str, Any]:

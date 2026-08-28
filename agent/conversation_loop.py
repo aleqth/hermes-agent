@@ -2582,6 +2582,25 @@ def run_conversation(
             if _moa_prepared_request is not None:
                 api_messages = _moa_prepared_request["messages"]
 
+        # Desktop sessions can preserve image-bearing user turns for durable
+        # continuity. Providers must not receive every historical screenshot
+        # again on each call: sanitize only this outbound copy, newest-first,
+        # while leaving ``messages`` and persisted session history untouched.
+        from agent.session_budget import sanitize_inline_images_for_provider
+
+        api_messages, _inline_image_sanitization = (
+            sanitize_inline_images_for_provider(agent, api_messages)
+        )
+        if _moa_prepared_request is not None:
+            _moa_prepared_request["messages"] = api_messages
+        if _inline_image_sanitization.changed:
+            _image_notice = _inline_image_sanitization.notice
+            if _image_notice != getattr(agent, "_inline_image_trim_notice", ""):
+                agent._inline_image_trim_notice = _image_notice
+                agent._buffer_status(_image_notice)
+        else:
+            agent._inline_image_trim_notice = ""
+
         # One image-stripped message estimate feeds both figures. Was: a
         # str(msg) char walk (re-serialized base64 every call) + a second
         # messages walk inside estimate_request_tokens_rough. Tools added
