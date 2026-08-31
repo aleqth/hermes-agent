@@ -11,6 +11,7 @@ Run with:  python -m pytest tests/test_delegate.py -v
 
 import json
 import os
+import sys
 import threading
 import time
 import types
@@ -882,6 +883,32 @@ class TestDelegationCredentialResolution(unittest.TestCase):
 
 class TestDelegationProviderIntegration(unittest.TestCase):
     """Integration tests: delegation config → _run_single_child → AIAgent construction."""
+
+    @patch("tools.delegate_tool._load_config")
+    @patch("tools.delegate_tool._resolve_delegation_credentials")
+    def test_null_iteration_cap_is_unlimited(self, mock_creds, mock_cfg):
+        """A null delegation cap must reach every child as the unlimited sentinel."""
+        mock_cfg.return_value = {"max_iterations": None}
+        mock_creds.return_value = {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+        }
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "done", "completed": True, "api_calls": 1
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Long coding task", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["max_iterations"], sys.maxsize)
 
     @patch("tools.delegate_tool._load_config")
     @patch("tools.delegate_tool._resolve_delegation_credentials")

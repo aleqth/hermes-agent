@@ -22,6 +22,7 @@ import contextvars
 import json
 import logging
 import re
+import sys
 
 logger = logging.getLogger(__name__)
 import os
@@ -1089,7 +1090,10 @@ def _preserve_parent_mcp_toolsets(
     return preserved
 
 
-DEFAULT_MAX_ITERATIONS = 250
+# Match the parent-agent contract: delegated agents are unbounded unless the
+# user explicitly opts into a positive cap in delegation.max_iterations.
+# sys.maxsize is the runtime's portable "unlimited" sentinel.
+DEFAULT_MAX_ITERATIONS = sys.maxsize
 # Hard per-summary character ceiling layered on top of the dynamic
 # headroom budget (see _apply_summary_budget). Belt-and-suspenders for
 # models that ignore the "be concise" instruction. 0 disables the ceiling.
@@ -1762,7 +1766,7 @@ def _build_child_agent(
     )
 
     # Each subagent gets its own iteration budget capped at max_iterations
-    # (configurable via delegation.max_iterations, default 50).  This means
+    # (configurable via delegation.max_iterations, unlimited by default). This means
     # total iterations across parent + subagents can exceed the parent's
     # max_iterations.  The user controls the per-subagent cap in config.yaml.
 
@@ -3710,7 +3714,10 @@ def delegate_task(
 
     # Load config
     cfg = _load_config()
-    default_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+    raw_max_iter = cfg.get("max_iterations", DEFAULT_MAX_ITERATIONS)
+    from hermes_cli.config import resolve_turn_limit
+
+    default_max_iter = resolve_turn_limit(raw_max_iter)
     # Model-supplied max_iterations is ignored — the config value is authoritative
     # so users get predictable budgets. The kwarg is retained for internal callers
     # and tests; a model-emitted value here would only shrink the budget and

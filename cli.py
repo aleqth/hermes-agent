@@ -475,7 +475,7 @@ def load_cli_config() -> Dict[str, Any]:
             "min_tail_user_messages": 1,  # Real user messages guaranteed in the tail (1 = existing single anchor)
         },
         "agent": {
-            "max_turns": 500,  # Default max tool-calling iterations (shared with subagents)
+            "max_turns": None,  # Unlimited unless the user explicitly sets a positive cap
             "verbose": False,
             "system_prompt": "",
             "prefill_messages_file": "",
@@ -532,7 +532,7 @@ def load_cli_config() -> Dict[str, Any]:
             },
         },
         "delegation": {
-            "max_iterations": 45,  # Max tool-calling turns per child agent
+            "max_iterations": None,  # Unlimited unless explicitly capped
             "model": "",       # Subagent model override (empty = inherit parent model)
             "provider": "",    # Subagent provider override (empty = inherit parent provider)
             "base_url": "",    # Direct OpenAI-compatible endpoint for subagents
@@ -5033,7 +5033,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             reasoning: Reasoning effort override for this run (none|minimal|low|medium|high|xhigh|max|ultra). Wins over config.
             api_key: API key (default: from environment)
             base_url: API base URL (default: OpenRouter)
-            max_turns: Maximum tool-calling iterations shared with subagents (default: 500)
+            max_turns: Maximum tool-calling iterations (default: unlimited)
             verbose: Enable verbose logging
             compact: Use compact display mode
             resume: Session ID to resume (restores conversation history from SQLite)

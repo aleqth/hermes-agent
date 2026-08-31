@@ -8050,11 +8050,12 @@ def _cfg_max_turns(cfg: dict, default: int) -> int:
     # Config file value — route through resolve_turn_limit so that
     # "none"/"unlimited"/0 are first-class spellings, not int() crashes.
     agent_cfg = cfg.get("agent") or {}
-    raw = agent_cfg.get("max_turns")
-    if raw is None:
-        raw = cfg.get("max_turns")
-    if raw is not None:
-        return _resolve_turn_limit(raw, default=default)
+    # Key presence matters: an explicit YAML null means unlimited, while an
+    # absent key preserves the caller's legacy fallback.
+    if "max_turns" in agent_cfg:
+        return _resolve_turn_limit(agent_cfg.get("max_turns"))
+    if "max_turns" in cfg:
+        return _resolve_turn_limit(cfg.get("max_turns"))
     return default
 
 

@@ -1769,7 +1769,7 @@ def setup_terminal_backend(config: dict):
 
 def _apply_default_agent_settings(config: dict):
     """Apply recommended defaults for all agent settings without prompting."""
-    config.setdefault("agent", {})["max_turns"] = 150
+    config.setdefault("agent", {})["max_turns"] = None
     # config.yaml is the authoritative source for max_turns; the gateway
     # bridges it into HERMES_MAX_ITERATIONS at startup. We no longer write
     # to .env to avoid the dual-source inconsistency that caused the
@@ -3520,7 +3520,7 @@ def _blank_slate_minimize_config(config: dict):
     Everything here is opt-in afterwards via ``hermes setup agent`` /
     ``hermes config set``. We keep only what's needed to run.
     """
-    config.setdefault("agent", {})["max_turns"] = 90
+    config.setdefault("agent", {})["max_turns"] = None
 
     # Compression off — minimal footprint; user opts in if they want long sessions.
     config.setdefault("compression", {})["enabled"] = False

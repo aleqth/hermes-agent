@@ -16739,6 +16739,17 @@ def test_make_agent_reads_nested_max_turns(monkeypatch):
     assert mock_agent.call_args.kwargs["max_iterations"] == 200
 
 
+def test_make_agent_explicit_null_max_turns_is_unlimited(monkeypatch):
+    import sys
+
+    _setup_make_agent_mocks(monkeypatch, {"agent": {"max_turns": None}})
+
+    with patch("run_agent.AIAgent") as mock_agent:
+        server._make_agent("sid-unlimited", "key-unlimited")
+
+    assert mock_agent.call_args.kwargs["max_iterations"] == sys.maxsize
+
+
 def test_make_agent_waits_for_shared_mcp_discovery(monkeypatch):
     _setup_make_agent_mocks(monkeypatch, {})
     waited = []

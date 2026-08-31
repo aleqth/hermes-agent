@@ -2060,8 +2060,9 @@ DEFAULT_CONFIG = {
         # extras" without silently stripping MCP tools the parent already has.
         # Set to false for strict intersection.
         "inherit_mcp_toolsets": True,
-        "max_iterations": 250,  # per-subagent iteration cap (each subagent gets its own budget,
-                               # independent of the parent's max_iterations)
+        # Unlimited by default, matching agent.max_turns. Set a positive
+        # integer to opt into a per-child cap; null/0/"unlimited" disable it.
+        "max_iterations": None,
         # Subagent summaries return to the parent's context verbatim. A batch
         # fan-out (N children) returns N summaries at once, which can exceed
         # the parent's context window and trigger a compression/429 death
