@@ -505,6 +505,16 @@ def finalize_turn(
         logger=logger,
     )
 
+    # Normal text was checked before its first flush. Budget/recovery exits
+    # reach this path first, before completion status and final persistence.
+    from agent.kanban_stop import guard_kanban_final_response
+    if final_response is not None and not interrupted:
+        final_response = guard_kanban_final_response(agent, final_response)
+    kanban_rejected = bool(getattr(agent, "_kanban_terminal_rejected_reason", None))
+    if kanban_rejected:
+        failed = True
+        _turn_exit_reason = "kanban_task_open"
+
     # Loop exits that are failures in their own right (outer-loop error cap, shutdown, context
     # that could not be shrunk) carry the verdict the UI descriptor needs; a bare
     # ``turn_exit_reason`` collapsed to code="unknown", retryable=True on every surface.
@@ -582,7 +592,7 @@ def finalize_turn(
     _platform = getattr(agent, "platform", None) or ""
     _response_transformed = False
     _pre_transform_response = None
-    if final_response and not interrupted:
+    if final_response and not interrupted and not kanban_rejected:
         final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
             agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
@@ -618,6 +628,7 @@ def finalize_turn(
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
+        "kanban_status": getattr(agent, "_kanban_terminal_status", "not_applicable"),
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
@@ -646,6 +657,9 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    if kanban_rejected:
+        result["failure_reason"] = "kanban_task_open"
+        result["error"] = getattr(agent, "_kanban_terminal_rejected_reason")
     # Persistence failures already set failed=True; also stamp `error` so the gateway
     # surfaces status="error" (desktop can toast) instead of a quiet complete frame, plus
     # the machine-readable cause 'session_persistence_failed:<locked|compression|...>'.

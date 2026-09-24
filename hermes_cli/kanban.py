@@ -938,6 +938,10 @@ def _cmd_complete(args: argparse.Namespace) -> int:
                     detail = ", ".join(f"{pid} ({status})" for pid, status in blockers)
                     fail_msg[tid] = (f"cannot complete {tid}: unsatisfied parent dependencies: {detail}; "
                                      f"complete the parents first, or `hermes kanban unlink <parent> {tid}`.")
+                else:
+                    task = kb.get_task(conn, tid)
+                    if task and task.last_failure_error:
+                        fail_msg[tid] = f"cannot complete {tid}: {task.last_failure_error}"
             return done
 
         return _bulk_apply(ids, op, lambda tid: f"Completed {tid}", fail_msg.__getitem__)

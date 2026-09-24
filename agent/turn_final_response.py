@@ -317,6 +317,16 @@ def finish_text_response(
         else:
             final_msg["content"] = final_response
 
+    # Guard before the first durable flush: a rejected terminal call must not
+    # persist a successful completion claim after recovery nudges are exhausted.
+    from agent.kanban_stop import guard_kanban_final_response
+    _kanban_text = guard_kanban_final_response(agent, final_response)
+    if _kanban_text != final_response:
+        final_response = _kanban_text
+        final_msg["content"] = final_response
+        if _promoted:
+            final_msg["api_content"] = final_response
+
     append_message(messages, final_msg)
     # Make the answer durable before leaving the loop (_DB_PERSISTED_MARKER keeps
     # _persist_session idempotent). Failure must NOT abort the turn: finalize retries.

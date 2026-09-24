@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import os
 
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
@@ -15,6 +16,8 @@ from agent.kanban_stop import (
 def clear_kanban_env(monkeypatch):
     for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE"):
         monkeypatch.delenv(var, raising=False)
+    monkeypatch.setattr("agent.kanban_stop.owned_run_state", lambda: {
+        "task_id": os.environ.get("HERMES_KANBAN_TASK", ""), "status": "running", "error": ""})
     return monkeypatch
 
 
@@ -90,6 +93,7 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
         {"role": "tool", "name": "kanban_complete", "tool_call_id": "1", "content": "done"},
     ]
     assert session_called_kanban_terminal(messages) is True
+    clear_kanban_env.setattr("agent.kanban_stop.owned_run_state", lambda: {"task_id": "t_abc", "status": "done"})
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
@@ -133,6 +137,7 @@ def test_no_nudge_after_handoff_tool(clear_kanban_env, tool_name, who):
         {"role": "tool", "name": tool_name, "tool_call_id": "1", "content": "ok"},
     ]
     assert session_called_kanban_terminal(messages) is True, who
+    clear_kanban_env.setattr("agent.kanban_stop.owned_run_state", lambda: {"task_id": "t_handoff", "status": "review"})
     assert build_kanban_stop_nudge(messages=messages) is None
 
 

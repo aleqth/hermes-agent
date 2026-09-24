@@ -479,7 +479,10 @@ KANBAN_CREATE_SCHEMA = _schema(
         )),
         "completion_contract": _prop("string", (
             "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
-            "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr."
+            "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr. "
+            "For independently checked local outputs use verify:/absolute/manifest.json; its hermes.readback/v1 outcome and checks "
+            "are frozen at creation. Each check has id, absolute path, and kind: file_sha256 with sha256, or json_equals with "
+            "pointer (keys/indexes) and expected. Completion reads the actual files; missing or wrong output keeps the task open."
         )),
         "goal_max_turns": _prop("integer", (
                 "Turn budget for goal_mode workers. Caps how many "

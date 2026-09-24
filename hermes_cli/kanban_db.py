@@ -3992,6 +3992,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     now = int(time.time())
     lines: list[str] = []
     _ctx_header(lines, task)
+    _ctx_acceptance(lines, conn, task)
     _ctx_attachments(lines, list_attachments(conn, task_id))
     _ctx_prior_attempts(lines, conn, task_id, now)
     _ctx_parent_results(lines, conn, task_id, now)
@@ -4008,6 +4009,39 @@ def _ctx_cap(s: Optional[str], limit: int = _CTX_MAX_FIELD_BYTES) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + f"… [truncated, {len(s) - limit} chars omitted]"
+
+
+def _ctx_acceptance(lines: list[str], conn: sqlite3.Connection, task: Task) -> None:
+    """Mount durable acceptance and failure state even after transcript loss.
+
+    The board is the source of truth; no second mutable task store is created.
+    Worker proposals/comments remain distinct from verifier observations.
+    """
+    contract = task.completion_contract or "local-only"
+    lines.extend(["## Saved completion contract", f"Current run: {task.current_run_id or '(not claimed)'}"])
+    if contract.startswith("verify-v1:"):
+        try:
+            spec = json.loads(contract[len("verify-v1:"):])
+            lines.append("Outcome: " + _ctx_cap(spec["outcome"]))
+            lines.append("The following checks are frozen in the board; the source manifest is not authoritative.")
+            for check in spec["checks"]:
+                lines.append("- " + _ctx_cap(json.dumps(check, ensure_ascii=False, sort_keys=True)))
+        except (ValueError, TypeError, KeyError):
+            lines.append("Contract is unreadable. Preserve the task and report the intake error.")
+    elif contract == "local-only":
+        lines.append("local-only: no independent artifact or CI acceptance was declared. A board label alone is not proof of a user outcome.")
+    else:
+        lines.append("Required PR acceptance: " + _ctx_cap(contract))
+    row = conn.execute("SELECT kind, payload FROM task_events WHERE task_id=? AND kind IN ('artifact_acceptance','pr_acceptance') ORDER BY id DESC LIMIT 1", (task.id,)).fetchone()
+    if row:
+        lines.append("Latest verifier observation (not a worker assertion): " + _ctx_cap(row["payload"]))
+    if task.last_failure_error:
+        lines.append("Saved failure: " + _ctx_cap(task.last_failure_error))
+    if task.status in {"done", "archived"}:
+        lines.append("This task is terminal. Reuse its scoped evidence; do not rerun or reopen it without a new authorized reason.")
+    else:
+        lines.append("Continue only with current ownership of this task and workspace. Inspect saved evidence before repeating work. Repair failed checks, then retry completion; use kanban_comment to checkpoint changed paths, evidence and next executable action. Only an accepted board transition ends this run.")
+    lines.append("")
 
 
 def _ctx_stamp(ts: int, now: int) -> str:

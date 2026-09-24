@@ -9,6 +9,8 @@ instead of exiting.
 from __future__ import annotations
 
 import os
+import sqlite3
+from contextlib import closing
 from typing import Any, Iterable, Optional
 
 from agent.delegation_context import owned_kanban_task
@@ -60,6 +62,52 @@ def session_called_kanban_terminal(messages: Iterable[dict] | None) -> bool:
     return False
 
 
+def owned_run_state() -> dict | None:
+    """Read the dispatcher's durable run, never infer acceptance from a tool call.
+
+    No migration, model request, or subprocess on this turn-end path. A dead or
+    stale worker must never resume its successor's work. Missing run identity is
+    explicitly unknown; a tool invocation does not fill that gap.
+    """
+    tid = owned_kanban_task()
+    if not tid:
+        return None
+    state = {"task_id": tid, "status": "unavailable", "error": "Cannot read this worker's owned board run."}
+    try:
+        run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
+        from hermes_cli import kanban_db as kb
+        with closing(sqlite3.connect(kb.kanban_db_path().resolve().as_uri() + "?mode=ro",
+                                    uri=True, timeout=1)) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("BEGIN")  # One snapshot for run identity + task details.
+            status = kb.goal_run_status(conn, tid, run_id)
+            task = kb.get_task(conn, tid)
+            state.update(status=status or "superseded", run_id=run_id,
+                         error=(task.last_failure_error or "") if task and status == "running" else "")
+    except (OSError, ValueError, sqlite3.Error):
+        pass
+    return state
+
+
+def guard_kanban_final_response(agent, final_response):
+    """A bounded recovery exit stays visibly OPEN, including persisted output.
+
+    This guards worker lifecycle truth, not arbitrary chat or semantic proof.
+    It does not mark the card blocked or spend an additional model call.
+    """
+    state = owned_run_state()
+    agent._kanban_terminal_rejected_reason = None
+    agent._kanban_terminal_status = state["status"] if state else "not_applicable"
+    if state and state["status"] in {"running", "unavailable", "superseded"}:
+        detail = state["error"] or ("This run no longer owns the task." if state["status"] == "superseded"
+                                    else "No terminal board transition was accepted.")
+        agent._kanban_terminal_rejected_reason = detail
+        return (f"Task {state['task_id']} remains OPEN for this worker: {detail} "
+                "Work and acceptance remain on the board. Resume the same task from its saved context; "
+                "do not recreate it or claim completion.")
+    return final_response
+
+
 def build_kanban_stop_nudge(
     *,
     messages: Iterable[dict] | None = None,
@@ -72,28 +120,37 @@ def build_kanban_stop_nudge(
     if (
         not kanban_stop_nudge_enabled()
         or attempts >= max_attempts
-        or session_called_kanban_terminal(messages)
     ):
         return None
 
-    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
-    # The transcript is the status source: this text is only reached when the session made no
-    # handoff call, so it never tells a worker to close a card it already sent to review.
+    state = owned_run_state()
+    if state and state["status"] not in {"running", "unavailable"}:
+        return None
+    tid = state["task_id"] if state else (task_id or "this task")
+    if state and state["status"] == "unavailable":
+        return (
+            f"[System: Task `{tid}` ownership could not be verified. Use kanban_show to read the "
+            "saved task and run. Do not mutate it without current ownership or report it complete. "
+            "If the board is unavailable, preserve the exact error and next recovery action.]"
+        )
+    detail = (state or {}).get("error", "")
     return (
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
-        f"Task `{tid}` has not been handed off: this session made no terminal board "
-        "call (`kanban_complete` / `kanban_request_review` / `kanban_block`). Ending now "
-        "causes a protocol violation (clean exit with the card still `running`).\n\n"
+        f"Task `{tid}` is still running in your owned run. A called or rejected terminal "
+        "tool is not an accepted handoff. The saved board state is authoritative.\n"
+        + (f"Last failure: {detail[:4096]}\n" if detail else "") +
         "Do this immediately in your next response — do not narrate intent:\n"
         "1. Finish any remaining deliverable (write the required file(s) now).\n"
         "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work is done "
         "and needs no review, `kanban_request_review(summary=...)` if it is a code "
         "change that needs same-card review, OR `kanban_block(reason=...)` if you are "
-        "blocked. Reviewers approve with `kanban_complete` or send the card back with "
+        "blocked by an external dependency you cannot resolve. A failed query or rejected "
+        "check calls for inspection and repair in this run. Reviewers approve with `kanban_complete` or send the card back with "
         "`kanban_request_changes(reason=...)`.\n\n"
-        "Never end a turn with only a promise of future action. Repeated "
-        "protocol violations will block this task and require manual intervention.]"
+        "Use kanban_comment to save changed paths, observed evidence, the failed check and "
+        "next executable action before yielding. Preserve this task ID and workspace. "
+        "Two identical failures require a changed hypothesis; do not repeat unchanged work.]"
     )
 
 

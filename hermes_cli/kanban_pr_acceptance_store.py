@@ -19,6 +19,9 @@ def prepare_acceptance(conn, task_id, expected_run_id, metadata):
         return None
     if status not in {"running", "ready", "blocked", "review"} or (expected_run_id is not None and run_id != expected_run_id):
         return False
+    if contract.startswith("verify-v1:"):
+        from hermes_cli.kanban_readback_acceptance import collect_readback
+        return snapshot, collect_readback(contract)
     published_pr = metadata.get("published_pr") if isinstance(metadata, dict) else None
     match = _PR.fullmatch(published_pr) if isinstance(published_pr, str) else None
     # Publication binds once. Retrying cannot replace the task's PR with a green sibling.
@@ -38,8 +41,14 @@ def record_acceptance(conn, task_id, acceptance):
     snapshot, receipt = acceptance
     if _snapshot(conn, task_id) != snapshot:
         return False
-    _append_event(conn, task_id, "pr_acceptance", receipt, run_id=snapshot[0])
+    kind = receipt.get("kind", "pr_acceptance")
+    if kind == "artifact_acceptance" and receipt["ok"]:
+        from hermes_cli.kanban_readback_acceptance import readback_unchanged
+        if not readback_unchanged(receipt):
+            receipt.update(ok=False, classification="stale", detail="Artifact changed after readback; retry completion.")
+    _append_event(conn, task_id, kind, receipt, run_id=snapshot[0])
     if not receipt["ok"]:
-        detail = f"PR acceptance {receipt['classification']}: {receipt.get('detail', '')} {receipt['recovery']}"
+        label = "Artifact" if kind == "artifact_acceptance" else "PR"
+        detail = f"{label} acceptance {receipt['classification']}: {receipt.get('detail', '')} {receipt['recovery']}"
         conn.execute("UPDATE tasks SET last_failure_error=? WHERE id=?", (detail, task_id))
     return receipt["ok"]
