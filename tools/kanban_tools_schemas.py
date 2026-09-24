@@ -478,7 +478,8 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "work. Defaults to false (classic single-shot worker)."
         )),
         "completion_contract": _prop("string", (
-            "Declare at creation: local-only (default), OWNER/REPO for PR publication, or an exact GitHub PR URL. "
+            "Declare acceptance before creation. Boards with required verification reject omitted/local-only contracts without creating a task. "
+            "Legacy boards default to local-only; use OWNER/REPO for PR publication or an exact GitHub PR URL. "
             "PR tasks cannot complete until repository-required exact-head CI passes. On publication pass metadata.published_pr. "
             "For independently checked local outputs use verify:/absolute/manifest.json; its hermes.readback/v1 outcome and checks "
             "are frozen at creation. Each check has id, absolute path, and kind: file_sha256 with sha256, or json_equals with "

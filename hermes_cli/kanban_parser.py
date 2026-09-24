@@ -149,6 +149,11 @@ _BOARD_SPECS = [
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
 _SPECS = [
     _cmd("init", help="Create kanban.db if missing (idempotent)"),
+    _cmd("acceptance-policy", [
+        _arg("--require-verified", action="store_true", help="Require a frozen artifact or PR verifier for every new task on this board"),
+        _arg("--allow-unverified", action="store_true", help="Allow legacy local-only creation again; existing tasks are unchanged"),
+        _json_flag(),
+    ], help="Read or set this board's new-task completion policy"),
     _cmd("boards", children=("boards_action", _BOARD_SPECS),
          help="Manage kanban boards (one board per project / workstream)",
          description=(

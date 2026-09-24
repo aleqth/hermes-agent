@@ -31,6 +31,7 @@ from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
     _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
+from hermes_cli.kanban_acceptance_policy import command as _cmd_acceptance_policy
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
 
 
@@ -1322,6 +1323,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 _HANDLERS = {
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
+    "acceptance-policy": _cmd_acceptance_policy,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,
     "reclaim": _cmd_reclaim, "reassign": _cmd_reassign,

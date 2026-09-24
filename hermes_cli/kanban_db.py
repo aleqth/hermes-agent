@@ -1341,6 +1341,8 @@ def create_task(
             # allow_nested: graph builders compose create_task under one outer
             # commit so the dispatcher never sees a half-built graph.
             with write_txn(conn, allow_nested=True):
+                from hermes_cli.kanban_acceptance_policy import enforce_new_task_contract
+                enforce_new_task_contract(conn, completion_contract)
                 task_status, tenant = initial_task_state(conn, parents, initial_status, triage, tenant)
                 # Project worktree: fresh dir under the repo + deterministic
                 # branch, instead of the random ``wt/<id>`` worker fallback.
