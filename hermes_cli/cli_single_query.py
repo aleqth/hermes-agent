@@ -9,9 +9,11 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 import logging
+import json
 import os
 import sys
 import time
+import sqlite3
 from agent.interrupt_compat import request_hard_interrupt
 from contextlib import suppress
 from pathlib import Path
@@ -22,6 +24,103 @@ logger = logging.getLogger("cli")
 
 if TYPE_CHECKING:
     from cli import HermesCLI
+
+
+def _jev_board_module():
+    """Load ANKLE's local board reader without enabling the retired tool hook."""
+    root = "/Users/alex/Desktop/solana-agent"
+    if root not in sys.path:
+        sys.path.append(root)
+    from jev_claw import board_consumer
+    return board_consumer
+
+
+def _capture_jev_board_intake(cli) -> dict | None:
+    """Read the owned run's frozen verifier before the first model request."""
+    from agent.delegation_context import owned_kanban_task
+    task_id = owned_kanban_task()
+    if not task_id:
+        return None
+    cli._jev_board_intake_error = None
+    try:
+        run_id = int(os.environ.get("HERMES_KANBAN_RUN_ID", ""))
+        from hermes_cli import kanban_db as kb
+        reader = _jev_board_module()
+        db_path = kb.kanban_db_path().resolve()
+        with sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            intake = reader.capture_owned_board_intake(conn, task_id=task_id, run_id=run_id)
+            task = kb.get_task(conn, task_id)
+        if intake is not None:
+            intake["db_path"] = str(db_path)
+        cli._jev_board_intake = intake
+        if intake is None and (task is None or (task.completion_contract or "").startswith("verify-v1:")):
+            cli._jev_board_intake_error = "owned task/run or frozen verifier unavailable at intake"
+        return intake
+    except (OSError, ValueError, sqlite3.Error, ImportError) as exc:
+        logger.warning("JEV board intake unavailable for %s: %s", task_id, type(exc).__name__)
+        cli._jev_board_intake = None
+        cli._jev_board_intake_error = f"{type(exc).__name__}: {exc}"
+        return None
+
+
+def _finish_jev_board_consumer(cli, result) -> dict | None:
+    """Issue a consumer receipt only for a verified completed owned run."""
+    intake = getattr(cli, "_jev_board_intake", None)
+    if intake is None:
+        intake_error = getattr(cli, "_jev_board_intake_error", None)
+        if intake_error:
+            outcome = {"status": "error", "error": intake_error,
+                       "recovery": "Inspect the frozen board task and rerun the same owned worker; no consumer receipt was issued."}
+            if isinstance(result, dict):
+                result["jev_board_consumer"] = outcome
+            print("JEV board consumer: " + json.dumps(outcome, sort_keys=True), file=sys.stderr)
+            return outcome
+        return None
+    from hermes_cli import kanban_db as kb
+    outcome = {"status": "pending", "task_id": intake["task_id"], "run_id": intake["run_id"],
+               "recovery": "Resume the same board task and satisfy its frozen verifier before completion."}
+    try:
+        reader = _jev_board_module()
+        db_path = Path(intake["db_path"])
+        with sqlite3.connect(db_path.as_uri() + "?mode=ro", uri=True) as conn:
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA query_only=ON")
+            destination = db_path.parent / "jev-consumer-receipts"
+            session_id = str(getattr(cli.agent, "session_id", "") or cli.session_id or "")
+            path = reader.issue_owned_board_receipt(conn, intake, worker_session_id=session_id,
+                                                    directory=destination)
+            if path is None:
+                task = kb.get_task(conn, intake["task_id"])
+                if task and task.status in {"blocked", "review", "ready"}:
+                    outcome.update(status="handoff", recovery="The board owns the next step; no completion receipt was issued.")
+            else:
+                reader.verify_board_consumer_receipt(conn, path)
+                outcome = {"status": "verified", "task_id": intake["task_id"],
+                           "run_id": intake["run_id"], "receipt": str(path),
+                           "sha256": reader._sha(path.read_bytes())}
+        if outcome["status"] == "verified":
+            from hermes_cli.kanban_db_connect import connect_closing
+            with connect_closing(db_path=db_path) as writer:
+                outcome["comment_id"] = reader.publish_board_pointer(writer, path)
+    except Exception as exc:
+        prior = outcome.get("status")
+        outcome.update(status="needs_index" if prior == "verified" else "error",
+                       error=f"{type(exc).__name__}: {exc}",
+                       recovery=(f"Run `python -m jev_claw.board_consumer --db {intake['db_path']} "
+                                 f"attach --receipt {outcome['receipt']}` to link the already verified receipt."
+                                 if prior == "verified" else
+                                 f"Inspect the board verifier and artifact; then run `python -m jev_claw.board_consumer "
+                                 f"--db {intake['db_path']} issue --task {intake['task_id']} "
+                                 f"--run {intake['run_id']} --out {Path(intake['db_path']).parent / 'jev-consumer-receipts'}`. "
+                                 "If accepted bytes changed, create a new reviewed artifact revision."))
+        logger.warning("JEV board consumer readback failed for %s: %s", intake["task_id"], exc)
+    if isinstance(result, dict):
+        result["jev_board_consumer"] = outcome
+    if outcome["status"] in {"verified", "needs_index", "error"}:
+        print("JEV board consumer: " + json.dumps(outcome, sort_keys=True), file=sys.stderr)
+    return outcome
 
 
 def _int_or(value, default: int) -> int:
@@ -80,7 +179,8 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str, run_turn=None
         return
 
     def _quiet_turn(prompt: str) -> str:
-        result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history)
+        result = cli.agent.run_conversation(user_message=prompt, conversation_history=cli.conversation_history,
+                                            task_id=task_id)
         _sync_cli_session_id_from_agent(cli)
         resp = result.get("final_response", "") if isinstance(result, dict) else str(result)
         if resp:
@@ -199,10 +299,16 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
     # A dispatcher's re-run of a failed bot delivery resumes the DM row its first attempt persisted.
     adopt_unanswered_turn(cli, effective_query)
     author_kwargs = {"turn_author": author} if author is not None and _accepts_keyword(cli.agent.run_conversation, "turn_author") else {}
+    from agent.delegation_context import owned_kanban_task
+    owned_task_id = owned_kanban_task()
+    if owned_task_id:
+        _capture_jev_board_intake(cli)
+    task_kwargs = {"task_id": owned_task_id} if owned_task_id else {}
     with bind_quiet_session_key(getattr(cli, "session_id", "") or "default"):
         try:
             result = cli.agent.run_conversation(
-                user_message=effective_query, conversation_history=cli.conversation_history, **author_kwargs,
+                user_message=effective_query, conversation_history=cli.conversation_history,
+                **task_kwargs, **author_kwargs,
             )
         except KeyboardInterrupt:
             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
@@ -231,7 +337,7 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
             def _follow_up(text):
                 nonlocal history
                 follow = cli.agent.run_conversation(
-                    user_message=text, conversation_history=history, **author_kwargs,
+                    user_message=text, conversation_history=history, **task_kwargs, **author_kwargs,
                 )
                 if isinstance(follow, dict) and follow.get("messages"):
                     history = follow["messages"]
@@ -279,6 +385,10 @@ def _run_quiet_single_query(cli, effective_query, emitter=None):
             _run_kanban_goal_loop_q(cli, response)
         except Exception as _goal_exc:
             logger.debug("kanban goal loop failed: %s", _goal_exc)
+
+    _finish_jev_board_consumer(cli, result)
+    if isinstance(result, dict):
+        _report_turn(result)
 
     if emitter is None:
         print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
@@ -499,6 +609,8 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
         if _query_label:
             cli.console.print(f"[bold blue]Query:[/] {_query_label}")
         cli._show_security_advisories()
+        if os.environ.get("HERMES_KANBAN_TASK"):
+            _capture_jev_board_intake(cli)
         response = cli.chat(query, images=single_query_images or None)
         # Kanban goal_mode on the `-q` path: same judge loop as `-Q`, but each follow-up turn
         # runs through cli.chat so the worker log keeps its live tool feed (the dispatcher
@@ -508,6 +620,7 @@ def _run_single_query_mode(cli, query, image, quiet, oneshot, stream_json: bool 
                 _run_kanban_goal_loop_chat(cli, response or "")
             except Exception as _goal_exc:
                 logger.debug("kanban goal loop failed: %s", _goal_exc)
+        _finish_jev_board_consumer(cli, getattr(cli, "_last_turn_result", None))
         cli._print_exit_summary(clear_screen=False)
         # Same exit contract as `-Q`: scripts and the Kanban dispatcher read the outcome from
         # the exit code. This path used to fall through to an implicit 0 for every outcome.

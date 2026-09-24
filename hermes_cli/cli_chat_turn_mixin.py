@@ -21,6 +21,12 @@ from typing import Optional
 from hermes_cli.cli_agent_setup_mixin import _retire_agent
 
 
+def _conversation_task_id(session_id: str) -> str:
+    """Use board identity only in the dispatcher-owned worker context."""
+    from agent.delegation_context import owned_kanban_task
+    return owned_kanban_task() or session_id
+
+
 class CLIChatTurnMixin:
     """chat() and its per-turn phase helpers."""
 
@@ -347,11 +353,12 @@ class CLIChatTurnMixin:
         try:
             from agent.notification_presentation import notification_turn
             muted = getattr(turn, "mute_notification_reply", False)
+            task_id = _conversation_task_id(self.session_id)
             with notification_turn(self.agent, muted=muted, session_id=self.session_id):
                 turn.result = self.agent.run_conversation(
                     user_message=agent_message,
                     conversation_history=self.conversation_history[:-1],
-                    stream_callback=None if muted else turn.stream_callback, task_id=self.session_id,
+                    stream_callback=None if muted else turn.stream_callback, task_id=task_id,
                     persist_user_message=_persist_clean_user_message, moa_config=_moa_cfg,
                 )
             if getattr(self, "_pending_moa_disable_after_turn", False):
