@@ -97,3 +97,26 @@ def test_acceptance_survives_handoffs_and_rejects_stale_artifacts_or_runs(tmp_pa
         assert kb.complete_task(conn, tid, summary="Fresh readback", expected_run_id=second)
         legacy = kb.create_task(conn, title="Existing local task", completion_contract="local-only")
         assert kb.complete_task(conn, legacy, summary="Existing local behavior")
+
+
+def test_completed_review_edit_retains_worker_provenance_and_verifier_events(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    manifest, artifact, data = _manifest(tmp_path)
+    artifact.write_bytes(data)
+    kb.init_db()
+    with connect() as conn:
+        tid = kb.create_task(conn, title="Review the delivered artifact", completion_contract="verify:" + str(manifest))
+        run = kb.claim_task(conn, tid).current_run_id
+        assert kb.complete_task(conn, tid, summary="Worker readback", expected_run_id=run,
+            metadata={"worker_session_id": "original-worker-session", "artifacts": [str(artifact)], "review": "pending"})
+        before = [tuple(r) for r in conn.execute("SELECT id,kind,run_id,payload FROM task_events WHERE task_id=? AND kind IN ('artifact_acceptance','completed') ORDER BY id", (tid,))]
+        assert kb.edit_task(conn, tid, result="Independent review recorded", metadata={"review": "accepted", "review_revision": "v2"})
+        meta = json.loads(conn.execute("SELECT metadata FROM task_runs WHERE id=?", (run,)).fetchone()[0])
+        assert meta["worker_session_id"] == "original-worker-session"
+        assert meta["artifacts"] == [str(artifact)]
+        assert meta["review"] == "accepted" and meta["review_revision"] == "v2"
+        after = [tuple(r) for r in conn.execute("SELECT id,kind,run_id,payload FROM task_events WHERE task_id=? AND kind IN ('artifact_acceptance','completed') ORDER BY id", (tid,))]
+        assert after == before
+        assert kb.get_task(conn, tid).status == "done"

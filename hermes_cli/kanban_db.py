@@ -3134,7 +3134,7 @@ def edit_task(
     result: Optional[str] = None, summary: Optional[str] = None,
     metadata: Optional[dict] = None, board: Optional[str] = None,
 ) -> bool:
-    """Edit task fields, optionally backfilling a completed task's result."""
+    """Edit task fields; supplied result metadata patches the completed run."""
     changed_fields = [
         field for field, value in (("title", title), ("body", body), ("priority", priority))
         if value is not None
@@ -3172,7 +3172,7 @@ def edit_task(
                 changed_fields.append("metadata")
             run = conn.execute(
             """
-            SELECT id FROM task_runs
+            SELECT id, metadata FROM task_runs
              WHERE task_id = ?
                AND outcome = 'completed'
              ORDER BY COALESCE(ended_at, started_at, 0) DESC, id DESC
@@ -3188,9 +3188,13 @@ def edit_task(
                 run_id = int(run["id"])
                 conn.execute("UPDATE task_runs SET summary = ? WHERE id = ?", (handoff_summary, run_id))
                 if metadata is not None:
+                    # A review supplements the run; it must not erase the
+                    # original worker session or artifact provenance.
+                    merged_metadata = _json_dict(run["metadata"])
+                    merged_metadata.update(metadata)
                     conn.execute(
                         "UPDATE task_runs SET metadata = ? WHERE id = ?",
-                        (json.dumps(metadata, ensure_ascii=False), run_id),
+                        (json.dumps(merged_metadata, ensure_ascii=False), run_id),
                     )
             _append_event(
                 conn, task_id, "edited",
