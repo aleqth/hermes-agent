@@ -127,6 +127,14 @@ def apply_stop_gates(
             ),
         )
 
+    from agent.interactive_acceptance import stop_nudge
+    _interactive_nudge = stop_nudge(agent)
+    if _interactive_nudge:
+        final_msg["finish_reason"] = "interactive_acceptance_required"
+        final_msg["_interactive_acceptance_synthetic"] = True
+        append_message(messages, final_msg)
+        return _continue(_interactive_nudge, "_interactive_acceptance_synthetic")
+
     _verify_nudge = _verify_on_stop_nudge(agent)
     if _verify_nudge:
         agent._verification_stop_nudges = getattr(agent, "_verification_stop_nudges", 0) + 1

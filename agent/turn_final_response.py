@@ -305,7 +305,7 @@ def finish_text_response(
     # assistant row as settled, so a transform after this write would reach the user but never
     # the stored/replayed transcript (#44239). finalize_turn reads the recorded outcome; like
     # there, an interrupted turn keeps the raw text.
-    from agent.turn_finalizer import apply_llm_output_transform
+    from agent.turn_finalizer import apply_jev_doctor_gate, apply_llm_output_transform
     _transformed = False
     if not getattr(agent, "_interrupt_requested", False):
         final_response, _transformed, _ = apply_llm_output_transform(
@@ -317,12 +317,30 @@ def finish_text_response(
         else:
             final_msg["content"] = final_response
 
+    # The first durable assistant flush occurs immediately below. A claimed
+    # DONE must pass Doctor here; waiting until finalize_turn is too late to
+    # replace the already settled SQLite row.
+    _doctor_text = apply_jev_doctor_gate(agent, final_response)
+    if _doctor_text != final_response:
+        final_response = _doctor_text
+        final_msg["content"] = final_response
+        if _promoted:
+            final_msg["api_content"] = final_response
+
     # Guard before the first durable flush: a rejected terminal call must not
     # persist a successful completion claim after recovery nudges are exhausted.
     from agent.kanban_stop import guard_kanban_final_response
     _kanban_text = guard_kanban_final_response(agent, final_response)
     if _kanban_text != final_response:
         final_response = _kanban_text
+        final_msg["content"] = final_response
+        if _promoted:
+            final_msg["api_content"] = final_response
+
+    from agent.interactive_acceptance import guard_final
+    _interactive_text = guard_final(agent, final_response)
+    if _interactive_text != final_response:
+        final_response = _interactive_text
         final_msg["content"] = final_response
         if _promoted:
             final_msg["api_content"] = final_response

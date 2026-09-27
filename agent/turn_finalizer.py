@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 from contextlib import suppress
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -23,7 +24,7 @@ from agent.served_model import result_model_fields
 # Verification-continuation nudges (verify-on-stop / pre_verify) must be stripped from
 # returned/live history to avoid role-alternation breaks; the assistant response is
 # real content and is not flagged. (#65919)
-_VERIFICATION_CONTINUATION_FLAGS = ("_verification_stop_synthetic", "_pre_verify_synthetic")
+_VERIFICATION_CONTINUATION_FLAGS = ("_verification_stop_synthetic", "_pre_verify_synthetic", "_interactive_acceptance_synthetic")
 
 _SENTENCE_END = {".", "!", "?", "。", "！", "？", "`", ")"}
 
@@ -33,6 +34,91 @@ _SESSION_TOKEN_KEYS = (
     "reasoning_tokens", "prompt_tokens", "completion_tokens", "total_tokens",
 )
 _SESSION_COST_KEYS = ("estimated_cost_usd", "cost_status", "cost_source")
+
+
+def apply_jev_doctor_gate(agent, final_response):
+    """Check a bound DONE before any final text is durably written.
+
+    Unbound Hermes turns retain their existing path. A bound DONE fails closed
+    if the local Doctor module or its evidence cannot be read.
+    """
+    bound = getattr(agent, "_jev_doctor_claimed_status", None) == "done" or getattr(agent, "_dada_out_packet", None) is not None
+    agent._jev_doctor_attempted = bound
+    if not bound:
+        agent._jev_doctor_rejected_reason = None
+        return final_response
+    root = "/Users/alex/Desktop/solana-agent"
+    inserted = False
+    try:
+        intake_error = getattr(agent, "_jev_doctor_intake_error", None)
+        if intake_error:
+            raise ValueError(f"accepted task intake invalid: {intake_error}")
+        if root not in sys.path:
+            sys.path.insert(0, root)
+            inserted = True
+        from jev_claw.doctor_done_gate import blocked_response, check_agent_done
+        decision = check_agent_done(agent)
+        if decision is None or decision.allowed:
+            agent._jev_doctor_rejected_reason = None
+            return final_response
+        reason = decision.reason
+        text = blocked_response(reason)
+    except Exception as exc:
+        reason = f"Doctor gate unavailable: {type(exc).__name__}: {exc}"
+        text = f"JEV Doctor blocked the completion claim: {reason}. The task remains open for the owner to resolve."
+    finally:
+        if inserted and root in sys.path:
+            sys.path.remove(root)
+    agent._jev_doctor_rejected_reason = reason
+    return text
+
+
+def bind_jev_accepted_task_at_intake(agent, task_id):
+    """Restore an explicit accepted-task binding on every turn, including restart.
+
+    ``task_id`` alone is a tool-resource scope in Hermes, not proof of task
+    acceptance. Only the frozen binding file is an acceptance signal.
+    """
+    prior = getattr(agent, "_jev_doctor_task_id", None)
+    if not task_id:
+        if prior:
+            for key in ("_jev_doctor_task_id", "_jev_doctor_claimed_status",
+                        "_jev_doctor_contract_path", "_jev_doctor_receipt_path", "_jev_doctor_intake_error"):
+                setattr(agent, key, None)
+        return
+    root = "/Users/alex/Desktop/solana-agent"
+    inserted = root not in sys.path
+    try:
+        if inserted:
+            sys.path.insert(0, root)
+        from hermes_constants import get_hermes_home
+        from jev_claw.doctor_done_gate import read_accepted_task_binding
+        record = read_accepted_task_binding(home=get_hermes_home(), session_id=agent.session_id, task_id=task_id)
+    except Exception as exc:
+        agent._jev_doctor_task_id = task_id
+        agent._jev_doctor_claimed_status = "done"
+        agent._jev_doctor_contract_path = None
+        agent._jev_doctor_receipt_path = None
+        agent._jev_doctor_intake_error = f"{type(exc).__name__}: {exc}"
+        return
+    finally:
+        if inserted:
+            sys.path.remove(root)
+    if record is None:
+        if prior == task_id:
+            agent._jev_doctor_intake_error = "accepted task binding disappeared"
+            agent._jev_doctor_claimed_status = "done"
+            return
+        if prior:
+            for key in ("_jev_doctor_task_id", "_jev_doctor_claimed_status",
+                        "_jev_doctor_contract_path", "_jev_doctor_receipt_path", "_jev_doctor_intake_error"):
+                setattr(agent, key, None)
+        return
+    agent._jev_doctor_task_id = task_id
+    agent._jev_doctor_claimed_status = "done"
+    agent._jev_doctor_contract_path = record["contract_path"]
+    agent._jev_doctor_receipt_path = record["receipt_path"]
+    agent._jev_doctor_intake_error = None
 
 
 def _assistant_row_missing_visible_text(msg: dict) -> bool:
@@ -505,8 +591,16 @@ def finalize_turn(
         logger=logger,
     )
 
-    # Normal text was checked before its first flush. Budget/recovery exits
-    # reach this path first, before completion status and final persistence.
+    # Normal text was checked before its first flush. Recovery and budget
+    # responses first reach this path, so check them before completed/status
+    # and before _persist_step shapes the transcript tail.
+    if final_response is not None and not interrupted:
+        final_response = apply_jev_doctor_gate(agent, final_response)
+    doctor_rejected = bool(getattr(agent, "_jev_doctor_rejected_reason", None))
+    if doctor_rejected:
+        failed = True
+        _turn_exit_reason = "jev_doctor_blocked"
+    # Independent of Doctor bindings: every board-owned worker uses durable state.
     from agent.kanban_stop import guard_kanban_final_response
     if final_response is not None and not interrupted:
         final_response = guard_kanban_final_response(agent, final_response)
@@ -514,6 +608,15 @@ def finalize_turn(
     if kanban_rejected:
         failed = True
         _turn_exit_reason = "kanban_task_open"
+
+    from agent.interactive_acceptance import guard_final
+    if final_response is not None and not interrupted:
+        final_response = guard_final(agent, final_response)
+    interactive_decision = getattr(agent, "_interactive_acceptance_decision", None) or {}
+    interactive_rejected = interactive_decision.get("status") == "OPEN"
+    if interactive_rejected:
+        failed = True
+        _turn_exit_reason = "interactive_task_open"
 
     # Loop exits that are failures in their own right (outer-loop error cap, shutdown, context
     # that could not be shrunk) carry the verdict the UI descriptor needs; a bare
@@ -592,7 +695,7 @@ def finalize_turn(
     _platform = getattr(agent, "platform", None) or ""
     _response_transformed = False
     _pre_transform_response = None
-    if final_response and not interrupted and not kanban_rejected:
+    if final_response and not interrupted and not doctor_rejected and not kanban_rejected and not interactive_rejected:
         final_response, _response_transformed, _pre_transform_response = _apply_output_hooks(
             agent, final_response, logger, platform=_platform, effective_task_id=effective_task_id,
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
@@ -628,7 +731,9 @@ def finalize_turn(
         "messages": messages,
         "api_calls": api_call_count,
         "completed": completed,
+        "doctor_status": "blocked" if doctor_rejected else ("allowed" if getattr(agent, "_jev_doctor_attempted", False) else "not_applicable"),
         "kanban_status": getattr(agent, "_kanban_terminal_status", "not_applicable"),
+        "interactive_acceptance": interactive_decision,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
         "partial": False,  # True only when stopped due to invalid tool calls
@@ -657,9 +762,15 @@ def finalize_turn(
     }
     if agent._tool_guardrail_halt_decision is not None:
         result["guardrail"] = agent._tool_guardrail_halt_decision.to_metadata()
+    if doctor_rejected:
+        result["failure_reason"] = "jev_doctor_blocked"
+        result["error"] = getattr(agent, "_jev_doctor_rejected_reason")
     if kanban_rejected:
         result["failure_reason"] = "kanban_task_open"
         result["error"] = getattr(agent, "_kanban_terminal_rejected_reason")
+    if interactive_rejected:
+        result["failure_reason"] = "interactive_task_open"
+        result["error"] = interactive_decision.get("reason")
     # Persistence failures already set failed=True; also stamp `error` so the gateway
     # surfaces status="error" (desktop can toast) instead of a quiet complete frame, plus
     # the machine-readable cause 'session_persistence_failed:<locked|compression|...>'.

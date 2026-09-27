@@ -1625,7 +1625,18 @@ def run_conversation(
     addresses, after every history rewrite including post-turn micro-compaction.
     """
     from agent.turn_context import export_current_turn_boundary
+    from agent.turn_finalizer import bind_jev_accepted_task_at_intake
     from tools.vision_tools_history_budget import native_turn_images
+
+    # A task_id by itself is only a tool-resource scope. Explicitly accepted
+    # tasks carry a frozen on-disk binding that survives agent/process restart.
+    bind_jev_accepted_task_at_intake(agent, task_id)
+
+    from agent.interactive_acceptance import prepare_turn
+    original_intake_message = user_message
+    user_message = prepare_turn(agent, user_message)
+    if persist_user_message is None and user_message != original_intake_message:
+        persist_user_message = original_intake_message
 
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
