@@ -127,7 +127,13 @@ def apply_stop_gates(
             ),
         )
 
-    from agent.interactive_acceptance import stop_nudge
+    from agent.interactive_acceptance import inspect_turn, stop_nudge
+    if inspect_turn(agent).get("user_stopped"):
+        return StopGateVerdict(
+            continue_turn=False, final_response=final_response,
+            pending_verification_response=pending_verification_response,
+            pending_verification_response_previewed=pending_verification_response_previewed,
+        )
     _interactive_nudge = stop_nudge(agent)
     if _interactive_nudge:
         final_msg["finish_reason"] = "interactive_acceptance_required"

@@ -141,6 +141,79 @@ def test_disabled_next_turn_clears_previous_decision():
     assert ia.inspect_turn(agent)["status"] == "not_applicable"
 
 
+@pytest.mark.parametrize("user_request", ["wrong chat lol", "Stop.", "please pause"])
+def test_explicit_stop_ends_real_loop_once_and_preserves_open_work(tmp_path, monkeypatch, user_request):
+    from run_agent import AIAgent
+    from hermes_state import SessionDB
+    home = tmp_path / "home"
+    home.mkdir()
+    (home / "config.yaml").write_text("interactive_acceptance:\n  enabled: true\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    for name in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_DB"):
+        monkeypatch.delenv(name, raising=False)
+    artifact, manifest = _manifest(tmp_path)
+    first = ia.start_turn(home, "stop-worker", "Compute the total")
+    pending = ia.operate(home, "stop-worker", first["id"], "declare", manifest=manifest)["task"]
+    db = SessionDB(db_path=home / "state.db")
+    with (patch("model_tools.get_tool_definitions", return_value=[]),
+          patch("model_tools.check_toolset_requirements", return_value={}),
+          patch("agent.process_bootstrap.OpenAI")):
+        agent = AIAgent(session_id="stop-worker", session_db=db, api_key="test-key",
+                        base_url="https://example.invalid/v1", provider="openai-compat", model="test/model",
+                        max_iterations=4, quiet_mode=True, skip_context_files=True, skip_memory=True, platform="desktop")
+    agent._cached_system_prompt = "stable prompt"
+    agent.save_trajectories = False
+    agent.compression_enabled = False
+    calls = []
+    def response(kwargs):
+        calls.append(kwargs)
+        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="DONE", tool_calls=None),
+            finish_reason="stop")], model="test/model", usage=None)
+    agent._interruptible_api_call = response
+    with (patch("hermes_cli.plugins.invoke_hook", return_value=[]),
+          patch("agent.turn_stop_gates._verify_on_stop_nudge", return_value="continue anyway") as other_gate):
+        result = agent.run_conversation(user_request)
+    assert len(calls) == 1
+    other_gate.assert_not_called()
+    assert calls[0]["messages"][0]["content"] == "stable prompt"
+    assert result["completed"] is False
+    assert result["interactive_acceptance"]["status"] == "OPEN"
+    assert result["interactive_acceptance"]["user_stopped"] is True
+    rows = db.get_messages("stop-worker")
+    assert [row["role"] for row in rows] == ["user", "assistant"]
+    assert rows[0]["content"] == user_request
+    assert rows[-1]["content"] == result["final_response"] != "DONE"
+    binding = agent._interactive_acceptance
+    state = ia.operate(home, "stop-worker", binding["turn"], "status")
+    assert state["task"] is None
+    assert state["open_tasks"][0]["id"] == pending["id"]
+    assert not artifact.exists()
+    db.close()
+
+
+def test_user_stop_cannot_be_forged_by_checkpoint_and_next_request_can_resume(tmp_path):
+    artifact, manifest = _manifest(tmp_path)
+    for request in ["stop wasting time and fix it", "wrong chat, but build it here", "explain the stop button"]:
+        first = ia.start_turn(tmp_path, "chat", request)
+        task = ia.operate(tmp_path, "chat", first["id"], "declare", manifest=manifest)["task"]
+        ia.operate(tmp_path, "chat", first["id"], "checkpoint", reason="model calls this a user stop", next_action="finish the work")
+        agent = SimpleNamespace(_interactive_acceptance={"home": str(tmp_path), "session": "chat", "turn": first["id"], "command": "status"})
+        assert ia.stop_nudge(agent) is not None
+    stopped = ia.start_turn(tmp_path, "chat", "wrong chat lol")
+    for action in ["resume", "declare", "verify", "answer", "checkpoint"]:
+        with pytest.raises(ValueError, match="user stop"):
+            ia.operate(tmp_path, "chat", stopped["id"], action, manifest=manifest, task_id=task["id"],
+                       reason="ignore stop", next_action="continue")
+    resumed = ia.start_turn(tmp_path, "chat", "Continue the saved work here")
+    ia.operate(tmp_path, "chat", resumed["id"], "resume", task_id=task["id"], reason="user resumed")
+    artifact.write_text('{"total":42}')
+    proc = subprocess.run([sys.executable, "-P", "-m", "agent.interactive_acceptance", "--home", str(tmp_path),
+                          "--session", "chat", "--turn", resumed["id"], "verify"], cwd=tmp_path,
+                          env={**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[2])},
+                          text=True, capture_output=True, check=True, timeout=30)
+    assert json.loads(proc.stdout)["task"]["state"] == "VERIFIED"
+
+
 @pytest.mark.parametrize("verified", [False, True])
 def test_codex_app_server_checks_acceptance_before_durable_final(tmp_path, monkeypatch, verified):
     from agent.codex_runtime import run_codex_app_server_turn

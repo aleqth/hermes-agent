@@ -27,6 +27,20 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _user_stop_request(request):
+    """Recognize standalone user control messages, never model checkpoint prose.
+
+    Keep this conservative: "stop wasting time and fix it" is still work.
+    Longer/ambiguous instructions remain subject to normal agent judgment.
+    """
+    return bool(re.fullmatch(
+        r"(?:(?:please|sorry|oops|oh)[ ,]+)*"
+        r"(?:stop|pause|cancel|wrong (?:chat|conversation))"
+        r"(?: (?:here|now|please|lol|thanks))?[.! ]*",
+        request.strip(), re.I,
+    ))
+
+
 def _answer_only_request(request):
     """Conservative, non-model exemption for short explanatory questions.
 
@@ -96,7 +110,8 @@ def start_turn(home, session, request):
         turn_id = uuid.uuid4().hex
         # A new request may have a different outcome. Never silently use an old
         # contract to accept it. Resuming is explicit and auditable below.
-        conn.execute("INSERT INTO turns VALUES(?,?,?,?,?,?)", (turn_id, session, request, None, "undecided", _now()))
+        disposition = "user_stop" if _user_stop_request(request) else "undecided"
+        conn.execute("INSERT INTO turns VALUES(?,?,?,?,?,?)", (turn_id, session, request, None, disposition, _now()))
         conn.execute("INSERT OR REPLACE INTO current_turn VALUES(?,?)", (session, turn_id))
         turn = _owned(conn, session, turn_id)
         _event(conn, turn, "intake", {"resumed_task": None})
@@ -107,6 +122,8 @@ def operate(home, session, turn_id, action, *, manifest=None, reason=None, next_
     """All lifecycle writes recheck the owning turn under the same transaction."""
     with _db(home) as conn:
         turn = _owned(conn, session, turn_id)
+        if turn["disposition"] == "user_stop" and action != "status":
+            raise ValueError("explicit user stop: preserve saved work until a new user request resumes it")
         task = conn.execute("SELECT * FROM tasks WHERE id=?", (turn["task"],)).fetchone()
         if action == "resume":
             if task or not task_id or not isinstance(reason, str) or not reason.strip():
@@ -205,6 +222,12 @@ def prepare_turn(agent, user_message):
             "For a real external dependency, user stop, or status-only question about an existing task, run checkpoint --reason 'observed state' --next-action 'specific action'; it stays OPEN. "
             "Never use answer/checkpoint to abandon executable accepted work. A new turn loads saved OPEN state; explicitly resume the matching outcome.\n"
             + command + " <declare|resume|verify|status|answer|checkpoint>\n[/Hermes durable task intake]")
+        if record["disposition"] == "user_stop":
+            guidance = ("\n\n[Hermes durable task intake]\n"
+                "The original user message explicitly stops work in this conversation. Acknowledge it and stop. "
+                "Existing unfinished tasks remain saved. Do not resume work, create a handoff task merely to pass "
+                "acceptance, or claim completion. A later user request can resume the original task.\n"
+                "[/Hermes durable task intake]")
     except Exception as exc:
         agent._interactive_acceptance_error = f"intake unavailable: {type(exc).__name__}"
         guidance = "\n\n[Hermes task intake is unavailable. Preserve OPEN and report the actual storage failure; do not claim verified completion.]"
@@ -223,6 +246,9 @@ def inspect_turn(agent):
     try:
         with _db(binding["home"]) as conn:
             turn = _owned(conn, binding["session"], binding["turn"])
+            if turn["disposition"] == "user_stop":
+                return {"status": "OPEN", "user_stopped": True,
+                        "reason": "user requested a stop; unfinished work remains saved"}
             snapshot = _snapshot(conn, turn)
             task = snapshot["task"]
             if task:
@@ -244,7 +270,7 @@ def inspect_turn(agent):
 
 def stop_nudge(agent):
     decision = inspect_turn(agent)
-    if decision["status"] != "OPEN" or getattr(agent, "_interactive_acceptance_nudges", 0) >= 2:
+    if decision.get("user_stopped") or decision["status"] != "OPEN" or getattr(agent, "_interactive_acceptance_nudges", 0) >= 2:
         return None
     binding = getattr(agent, "_interactive_acceptance", None)
     if not binding:
@@ -258,6 +284,8 @@ def stop_nudge(agent):
 def guard_final(agent, response):
     decision = inspect_turn(agent)
     agent._interactive_acceptance_decision = decision
+    if decision.get("user_stopped"):
+        return "Stopped. Any unfinished work remains saved and has not been marked complete."
     if decision["status"] == "OPEN":
         return f"Task OPEN — {decision.get('task_id', 'intake')}: {decision['reason']}. The task is saved for continuation; completion has not been verified."
     return response
