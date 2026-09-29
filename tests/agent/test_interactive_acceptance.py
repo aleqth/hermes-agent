@@ -142,7 +142,8 @@ def test_disabled_next_turn_clears_previous_decision():
 
 
 @pytest.mark.parametrize("user_request", ["wrong chat lol", "Stop.", "please pause"])
-def test_explicit_stop_ends_real_loop_once_and_preserves_open_work(tmp_path, monkeypatch, user_request):
+@pytest.mark.parametrize("api_mode", ["chat_completions", "codex_app_server"])
+def test_explicit_stop_ends_real_loop_once_and_preserves_open_work(tmp_path, monkeypatch, user_request, api_mode):
     from run_agent import AIAgent
     from hermes_state import SessionDB
     home = tmp_path / "home"
@@ -162,21 +163,29 @@ def test_explicit_stop_ends_real_loop_once_and_preserves_open_work(tmp_path, mon
                         base_url="https://example.invalid/v1", provider="openai-compat", model="test/model",
                         max_iterations=4, quiet_mode=True, skip_context_files=True, skip_memory=True, platform="desktop")
     agent._cached_system_prompt = "stable prompt"
+    agent.api_mode = api_mode
+    if user_request == "wrong chat lol" and api_mode == "chat_completions":
+        staged = {"role": "user", "content": user_request}
+        agent._flush_messages_to_session_db([staged])
+        agent._pending_cli_user_message = staged
     agent.save_trajectories = False
     agent.compression_enabled = False
     calls = []
     def response(kwargs):
         calls.append(kwargs)
-        return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content="DONE", tool_calls=None),
-            finish_reason="stop")], model="test/model", usage=None)
+        raise AssertionError("A model capable of writing artifacts must never receive a stop request")
     agent._interruptible_api_call = response
     with (patch("hermes_cli.plugins.invoke_hook", return_value=[]),
           patch("agent.turn_stop_gates._verify_on_stop_nudge", return_value="continue anyway") as other_gate):
         result = agent.run_conversation(user_request)
-    assert len(calls) == 1
+    assert len(calls) == 0
     other_gate.assert_not_called()
-    assert calls[0]["messages"][0]["content"] == "stable prompt"
-    assert result["completed"] is False
+    assert agent._cached_system_prompt == "stable prompt"
+    assert result["completed"] is True  # handled control turn, not a verified work task
+    assert result["interrupted"] is False
+    assert result["turn_id"] == agent._current_turn_id
+    assert result["messages"][result["current_turn_user_idx"]]["content"] == user_request
+    assert agent._relay_pending_turn_id is None
     assert result["interactive_acceptance"]["status"] == "OPEN"
     assert result["interactive_acceptance"]["user_stopped"] is True
     rows = db.get_messages("stop-worker")
@@ -188,6 +197,21 @@ def test_explicit_stop_ends_real_loop_once_and_preserves_open_work(tmp_path, mon
     assert state["task"] is None
     assert state["open_tasks"][0]["id"] == pending["id"]
     assert not artifact.exists()
+    from gateway.platforms.api_server_runs import terminal_run_status
+    from gateway.run import GatewayRunner, _normalize_empty_agent_response
+    from gateway.config import GatewayConfig
+    from unittest.mock import AsyncMock
+    import asyncio
+    assert terminal_run_status(result)[0] == "completed"
+    assert _normalize_empty_agent_response(result, result["final_response"]) == result["final_response"]
+    runner = GatewayRunner(GatewayConfig())
+    runner._deliver_queued_first_response = AsyncMock(return_value=True)
+    context = SimpleNamespace(session_key="stop-chat", stream_consumer_holder=[None],
+        mute_notification_reply=False, persist_user_display_kind=None, source=None,
+        _status_thread_metadata=None, event_message_id=None, inbound_message_id="stop-1", run_generation=1)
+    asyncio.run(runner._run_agent_deliver_first_response(context, None, result, result, None))
+    runner._deliver_queued_first_response.assert_awaited_once()
+    assert runner._deliver_queued_first_response.await_args.args[0] == result["final_response"]
     db.close()
 
 
@@ -214,7 +238,7 @@ def test_user_stop_cannot_be_forged_by_checkpoint_and_next_request_can_resume(tm
     assert json.loads(proc.stdout)["task"]["state"] == "VERIFIED"
 
 
-@pytest.mark.parametrize("verified", [False, True])
+@pytest.mark.parametrize("verified", [False, True, "user_stop"])
 def test_codex_app_server_checks_acceptance_before_durable_final(tmp_path, monkeypatch, verified):
     from agent.codex_runtime import run_codex_app_server_turn
     from hermes_state import SessionDB
@@ -228,10 +252,12 @@ def test_codex_app_server_checks_acceptance_before_durable_final(tmp_path, monke
         agent = AIAgent(session_id="codex-owned", session_db=db, api_key="test-key",
                         base_url="https://example.invalid/v1", provider="openai-compat", model="test/model",
                         quiet_mode=True, skip_context_files=True, skip_memory=True, platform="cli")
-    record = ia.start_turn(tmp_path, "codex-owned", "Compute total")
+    user_request = "wrong chat lol" if verified == "user_stop" else "Compute total"
+    record = ia.start_turn(tmp_path, "codex-owned", user_request)
     artifact, manifest = _manifest(tmp_path)
-    ia.operate(tmp_path, "codex-owned", record["id"], "declare", manifest=manifest)
-    if verified:
+    if verified != "user_stop":
+        ia.operate(tmp_path, "codex-owned", record["id"], "declare", manifest=manifest)
+    if verified is True:
         artifact.write_text('{"total":42}')
         ia.operate(tmp_path, "codex-owned", record["id"], "verify")
     agent._interactive_acceptance = {"home": str(tmp_path), "session": "codex-owned", "turn": record["id"]}
@@ -241,16 +267,21 @@ def test_codex_app_server_checks_acceptance_before_durable_final(tmp_path, monke
         interrupted=False, error=None, thread_id="thread-1", turn_id="turn-1", tool_iterations=0,
         final_text="DONE", projected_messages=[{"role": "assistant", "content": "DONE", "api_content": "DONE"}],
         should_retire=False)
-    messages = [{"role": "user", "content": "Compute total"}]
+    messages = [{"role": "user", "content": user_request}]
     agent._flush_messages_to_session_db(messages)
-    result = run_codex_app_server_turn(agent, user_message="Compute total", original_user_message="Compute total",
+    result = run_codex_app_server_turn(agent, user_message=user_request, original_user_message=user_request,
                                       messages=messages, effective_task_id="task")
-    assert result["completed"] is verified
-    assert result["interactive_acceptance"]["status"] == ("VERIFIED" if verified else "OPEN")
+    assert result["completed"] is (verified is True or verified == "user_stop")
+    assert result["interactive_acceptance"]["status"] == ("VERIFIED" if verified is True else "OPEN")
     rows = db.get_messages("codex-owned")
     assert len(rows) == 2
     assert rows[-1]["content"] == result["final_response"]
-    assert messages[-1]["api_content"] == result["final_response"]
+    if verified != "user_stop":
+        assert messages[-1]["api_content"] == result["final_response"]
     assert verified or result["final_response"].startswith("Task OPEN")
-    assert agent.session_api_calls == 1
+    if verified == "user_stop":
+        agent._codex_session.run_turn.assert_not_called()
+        assert agent.session_api_calls == 0
+    else:
+        assert agent.session_api_calls == 1
     db.close()

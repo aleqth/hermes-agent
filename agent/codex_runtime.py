@@ -626,6 +626,9 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
                               effective_task_id: str, should_review_memory: bool = False) -> Dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
     Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
+    from agent.interactive_acceptance import inspect_turn, finish_user_stop
+    if inspect_turn(agent).get("user_stopped"):
+        return finish_user_stop(agent, messages)
     # Defense in depth for compression.checkpoint_required: agent init refuses the combination, but
     # api_mode is mutable. Explicit-True check matches compress_context().
     if getattr(agent, "compression_checkpoint_required", False) is True:

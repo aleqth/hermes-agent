@@ -291,6 +291,33 @@ def guard_final(agent, response):
     return response
 
 
+def finish_user_stop(agent, messages, conversation_history=None):
+    """Persist a control reply without invoking a model, tool, or output hook.
+
+    The caller has already staged the original user row. Use the ordinary
+    persister so staged CLI rows and gateway history keep their dedup markers.
+    """
+    from agent.message_metadata import append_message
+    decision = inspect_turn(agent)
+    if not decision.get("user_stopped"):
+        raise ValueError("no original user stop at this intake")
+    response = guard_final(agent, "")
+    append_message(messages, {"role": "assistant", "content": response})
+    agent._last_turn_usage = None
+    agent._session_messages = messages
+    try:
+        persisted = agent._flush_messages_to_session_db(messages, conversation_history)
+    except Exception:
+        persisted = False
+    error = "stop_transcript_persistence_failed" if persisted is False else None
+    # The control turn was handled; its saved work task remains OPEN. Marking
+    # this as an interruption suppresses its acknowledgement in chat gateways.
+    return {"final_response": response, "messages": messages, "api_calls": 0,
+            "completed": not bool(error), "partial": False, "interrupted": False,
+            "failed": bool(error), "error": error, "turn_exit_reason": "user_stop",
+            "agent_persisted": persisted is True, "interactive_acceptance": decision}
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, default=None)

@@ -1632,11 +1632,33 @@ def run_conversation(
     # tasks carry a frozen on-disk binding that survives agent/process restart.
     bind_jev_accepted_task_at_intake(agent, task_id)
 
-    from agent.interactive_acceptance import prepare_turn
+    from agent.interactive_acceptance import prepare_turn, inspect_turn, finish_user_stop
     original_intake_message = user_message
     user_message = prepare_turn(agent, user_message)
     if persist_user_message is None and user_message != original_intake_message:
         persist_user_message = original_intake_message
+
+    if inspect_turn(agent).get("user_stopped"):
+        # Stop before context construction, model dispatch, auxiliary calls or
+        # tools. Keep the original user's row and the usual persistence markers.
+        from agent.turn_context import _stage_turn_user_message
+        messages = list(conversation_history) if conversation_history else []
+        clean_message = persist_user_message if persist_user_message is not None else original_intake_message
+        user_row, pending = _stage_turn_user_message(
+            agent, clean_message, clean_message, persist_user_timestamp,
+            persist_user_platform_id, persist_user_display_kind, persist_user_display_metadata,
+        )
+        append_message(messages, user_row)
+        agent._persist_user_message_idx = len(messages) - 1
+        agent._persist_user_message_override = clean_message
+        agent._persist_user_message_timestamp = persist_user_timestamp
+        agent._persist_user_message_platform_id = persist_user_platform_id
+        agent._current_turn_id = str(getattr(agent, "_relay_pending_turn_id", "") or "") or agent._interactive_acceptance["turn"]
+        agent._relay_pending_turn_id = None
+        result = finish_user_stop(agent, messages, conversation_history)
+        if result["agent_persisted"] and pending is not None:
+            agent._pending_cli_user_message = None
+        return export_current_turn_boundary(agent, result, clean_message)
 
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
