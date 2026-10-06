@@ -41,7 +41,10 @@ def test_intake_is_bound_to_actual_database_and_preserves_existing_tasks(tmp_pat
         assert verification_required(a)
         artifact = tmp_path / "output.json"
         manifest = tmp_path / "acceptance.json"
-        manifest.write_text(json.dumps({"schema":"hermes.readback/v1", "outcome":"Consumer reads count 2", "checks":[{"id":"count","kind":"json_equals","path":str(artifact),"pointer":["count"],"expected":2}]}))
+        manifest.write_text(json.dumps({"schema":"hermes.readback/v1", "outcome":"Consumer reads count 2", "checks":[
+            {"id":"bytes","kind":"file_sha256","path":str(artifact),"sha256":"57413ce83ee1d989e384dfd3a82c6e2d9052a23c4204706bd2d7df11aa4c2d7c"},
+            {"id":"count","kind":"json_equals","path":str(artifact),"pointer":["count"],"expected":2},
+        ]}))
         tid = kb.create_task(a, title="Verified work", completion_contract="verify:"+str(manifest))
         run = kb.claim_task(a, tid).current_run_id
         assert not kb.complete_task(a, tid, summary="premature", expected_run_id=run)

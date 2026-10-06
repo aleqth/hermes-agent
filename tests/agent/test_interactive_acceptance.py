@@ -15,8 +15,12 @@ from agent import interactive_acceptance as ia
 def _manifest(root):
     artifact = root / "answer.json"
     manifest = root / "manifest.json"
+    # Closing check is external file_sha256; json_equals remains advisory only.
     manifest.write_text(json.dumps({"schema": "hermes.readback/v1", "outcome": "Consumer receives the computed total",
-        "checks": [{"id": "total", "path": str(artifact), "kind": "json_equals", "pointer": ["total"], "expected": 42}]}))
+        "checks": [
+            {"id": "bytes", "path": str(artifact), "kind": "file_sha256", "sha256": "bb1453c7fec8dfc7c9d2c40136205f7cef6a1d9bb63e1ee85c038f04e730baa8"},
+            {"id": "total", "path": str(artifact), "kind": "json_equals", "pointer": ["total"], "expected": 42},
+        ]}))
     return artifact, manifest
 
 
@@ -110,8 +114,12 @@ def test_new_work_cannot_use_answer_escape_or_previous_contract(tmp_path):
     assert ia.inspect_turn(agent)["status"] == "OPEN"
     assert ia.operate(tmp_path, "session", second["id"], "status")["task"] is None
     manifest2 = tmp_path / "manifest2.json"
+    other = tmp_path / "different.json"
     manifest2.write_text(json.dumps({"schema":"hermes.readback/v1", "outcome":"Distinct result",
-        "checks":[{"id":"different", "kind":"json_equals", "path":str(tmp_path / "different.json"), "pointer":["x"], "expected":7}]}))
+        "checks":[
+            {"id":"bytes", "kind":"file_sha256", "path":str(other), "sha256": "132f255280292ae80b1211e2e4f47ec73c43013f31dd7b711e7bbe9448cbf6f0"},
+            {"id":"different", "kind":"json_equals", "path":str(other), "pointer":["x"], "expected":7},
+        ]}))
     new = ia.operate(tmp_path, "session", second["id"], "declare", manifest=manifest2)
     assert new["task"]["id"] != old["task"]["id"]
     assert len(new["open_tasks"]) == 2

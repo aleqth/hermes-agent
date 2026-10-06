@@ -99,6 +99,56 @@ def test_acceptance_survives_handoffs_and_rejects_stale_artifacts_or_runs(tmp_pa
         assert kb.complete_task(conn, legacy, summary="Existing local behavior")
 
 
+
+def test_json_equals_alone_cannot_close(tmp_path, monkeypatch):
+    """Self-certifying status JSON is advisory; closes need file_sha256 or http_sha256."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    from hermes_cli import kanban_readback_acceptance as readback
+    status = tmp_path / "agent_status.json"
+    status.write_text(json.dumps({"status": "done"}))
+    manifest = tmp_path / "acceptance.json"
+    manifest.write_text(json.dumps({
+        "schema": "hermes.readback/v1", "outcome": "Claim done via own JSON",
+        "checks": [{"id": "self", "kind": "json_equals", "path": str(status),
+                    "pointer": ["status"], "expected": "done"}]}))
+    try:
+        readback.freeze_contract("verify:" + str(manifest))
+        raised = False
+    except ValueError as exc:
+        raised = True
+        assert "json_equals alone" in str(exc) or "external check" in str(exc)
+    assert raised, "json_equals-only manifests must be rejected at freeze"
+
+
+def test_file_sha256_closes_even_if_advisory_json_equals_differs(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BOARD", raising=False)
+    from hermes_cli import kanban_readback_acceptance as readback
+    artifact = tmp_path / "result.bin"
+    data = b"external-bytes-proof"
+    artifact.write_bytes(data)
+    status = tmp_path / "agent_status.json"
+    status.write_text(json.dumps({"status": "open"}))
+    manifest = tmp_path / "acceptance.json"
+    manifest.write_text(json.dumps({
+        "schema": "hermes.readback/v1", "outcome": "External bytes win",
+        "checks": [
+            {"id": "bytes", "kind": "file_sha256", "path": str(artifact),
+             "sha256": hashlib.sha256(data).hexdigest()},
+            {"id": "advisory", "kind": "json_equals", "path": str(status),
+             "pointer": ["status"], "expected": "done"},
+        ]}))
+    contract = readback.freeze_contract("verify:" + str(manifest))
+    receipt = readback.collect_readback(contract)
+    assert receipt["ok"] is True
+    by_id = {c["id"]: c for c in receipt["checks"]}
+    assert by_id["bytes"]["closing"] is True and by_id["bytes"]["ok"] is True
+    assert by_id["advisory"]["closing"] is False
+
+
 def test_completed_review_edit_retains_worker_provenance_and_verifier_events(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
