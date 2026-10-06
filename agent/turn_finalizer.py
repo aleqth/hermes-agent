@@ -576,6 +576,12 @@ def finalize_turn(
         and (api_call_count < agent.max_iterations or str(_turn_exit_reason).startswith("text_response("))
     )
 
+    from agent.interactive_acceptance import guard_final, inspect_turn
+    if not interrupted:
+        final_response = guard_final(agent, final_response)
+    if inspect_turn(agent).get("status") == "OPEN":
+        completed = False
+
     _rollback_interrupted_preflight_display(agent, interrupted)
 
     from hermes_cli.observability.shared_metrics_harness import finish_turn
@@ -644,6 +650,9 @@ def finalize_turn(
             turn_id=turn_id, original_user_message=original_user_message, messages=messages,
         )
 
+    if not interrupted:
+        final_response = guard_final(agent, final_response)
+
     # Context engine observation hook: the turn finished with the finalized transcript.
     # Fail-open. ``_last_turn_usage`` is the last response's canonical usage dict, or
     # ``None`` on turns that never reached a provider response — by contract.
@@ -670,6 +679,7 @@ def finalize_turn(
 
     result = {
         "final_response": final_response,
+        "interactive_acceptance": inspect_turn(agent),
         "last_reasoning": _last_turn_reasoning(messages),
         "messages": messages,
         "api_calls": api_call_count,

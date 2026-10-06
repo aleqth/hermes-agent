@@ -129,6 +129,19 @@ def apply_stop_gates(
             ),
         )
 
+    from agent.interactive_acceptance import stop_nudge, guard_final
+    _acceptance_nudge = stop_nudge(agent)
+    if _acceptance_nudge:
+        # Keep unverified prose out of the persisted assistant final. The
+        # candidate remains internal while the agent gets a repair opportunity.
+        final_msg["content"] = guard_final(agent, final_response)
+        final_msg["finish_reason"] = "acceptance_required"
+        _append_interim_answer(agent, final_msg, messages, conversation_history,
+                              "acceptance interim flush failed")
+        return _continue(_acceptance_nudge, "_verification_stop_synthetic")
+    final_response = guard_final(agent, final_response)
+    final_msg["content"] = final_response
+
     _verify_nudge = _verify_on_stop_nudge(agent)
     if _verify_nudge:
         agent._verification_stop_nudges = getattr(agent, "_verification_stop_nudges", 0) + 1

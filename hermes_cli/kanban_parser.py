@@ -148,6 +148,11 @@ _BOARD_SPECS = [
 
 # Top-level ``hermes kanban <action>`` records, in ``--help`` order.
 _SPECS = [
+    _cmd("acceptance-policy", [
+        _arg("--require-verified", action="store_true"),
+        _arg("--allow-unverified", action="store_true"),
+        _json_flag(),
+    ], help="Inspect or set verified task intake policy"),
     _cmd("init", help="Create kanban.db if missing (idempotent)"),
     _cmd("boards", children=("boards_action", _BOARD_SPECS),
          help="Manage kanban boards (one board per project / workstream)",

@@ -21,6 +21,9 @@ _PR = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)/pull/([
 
 
 def validate_contract(value: str | None) -> str:
+    if isinstance(value, str) and value.startswith(("verify:", "verify-v1:")):
+        from hermes_cli.kanban_readback_acceptance import freeze_contract
+        return freeze_contract(value)
     if value is None or value == "local-only":
         return "local-only"
     if not isinstance(value, str) or not (_REPO.fullmatch(value) or _PR.fullmatch(value)):

@@ -1317,6 +1317,7 @@ def _cmd_decompose(args: argparse.Namespace) -> int:
 
 
 _HANDLERS = {
+    "acceptance-policy": lambda args: __import__("hermes_cli.kanban_acceptance_policy", fromlist=["command"]).command(args),
     "init": _cmd_init, "create": _cmd_create, "swarm": _cmd_swarm,
     "list": _cmd_list, "ls": _cmd_list, "show": _cmd_show,
     "assign": _cmd_assign, "set-model": _cmd_set_model,

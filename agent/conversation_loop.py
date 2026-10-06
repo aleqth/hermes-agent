@@ -1573,6 +1573,12 @@ def _run_conversation_turn(
     except Exception:
         logger.debug("per-turn env credential refresh failed", exc_info=True)
 
+    from agent.interactive_acceptance import prepare_turn
+    _original_intake_message = user_message
+    user_message = prepare_turn(agent, user_message)
+    if persist_user_message is None:
+        persist_user_message = _original_intake_message
+
     # Per-turn setup: build_turn_context mutates ``agent`` and returns the locals the loop reads.
     try:
         _ctx = build_turn_context(
@@ -1617,6 +1623,10 @@ def _run_conversation_turn(
         max_compression_attempts=getattr(agent, "max_compression_attempts", 3),
         **{f.name: getattr(_ctx, f.name.lstrip("_")) for f in fields(_LoopState) if f.name in _CTX_FIELDS},
     )
+    from agent.interactive_acceptance import inspect_turn, finish_user_stop
+    if inspect_turn(agent).get("user_stopped"):
+        return finish_user_stop(agent, s.messages, conversation_history)
+
     # Opt-in runtime: api_mode == codex_app_server hands the whole turn to the codex
     # app-server subprocess (see agent/transports/codex_app_server_session.py).
     if agent.api_mode == "codex_app_server":

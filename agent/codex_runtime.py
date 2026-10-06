@@ -661,6 +661,9 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
                               effective_task_id: str, should_review_memory: bool = False) -> Dict[str, Any]:
     """Hand the turn to a ``codex app-server`` subprocess and project its events into ``messages``.
     Returns the chat_completions result shape. The user message is ALREADY in ``messages`` — never append it again."""
+    from agent.interactive_acceptance import inspect_turn, guard_final, finish_user_stop
+    if inspect_turn(agent).get("user_stopped"):
+        return finish_user_stop(agent, messages)
     # Defense in depth for compression.checkpoint_required: agent init refuses the combination, but
     # api_mode is mutable. Explicit-True check matches compress_context().
     if getattr(agent, "compression_checkpoint_required", False) is True:
@@ -684,6 +687,13 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     if getattr(turn, "should_retire", False):
         logger.warning("codex app-server session retired (turn error: %s)", turn.error)
         _close_codex_session(agent)
+    turn.final_text = guard_final(agent, turn.final_text)
+    decision = inspect_turn(agent)
+    if turn.projected_messages:
+        for message in reversed(turn.projected_messages):
+            if message.get("role") == "assistant" and not message.get("tool_calls"):
+                message["content"] = message["api_content"] = turn.final_text
+                break
     # The binding is published only once the transcript it belongs to is durable, and never for a
     # retired thread (the next agent would only resume into the same wedge).
     if _persist_projected_messages(agent, turn, messages) and not getattr(turn, "should_retire", False):
@@ -692,7 +702,8 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
         agent, turn, messages, original_user_message=original_user_message, should_review_memory=should_review_memory,
     )
     return _turn_result(
-        interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None, error=turn.error,
+        interrupt, messages, api_calls=1, completed=not turn.interrupted and turn.error is None and decision["status"] != "OPEN", error=turn.error,
+        interactive_acceptance=decision,
         # We flushed the projected rows ourselves (agent_persisted); the gateway must skip its own DB write.
         final_response=turn.final_text, agent_persisted=True, codex_thread_id=turn.thread_id, codex_turn_id=turn.turn_id,
         **usage_result,
